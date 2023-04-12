@@ -2,7 +2,7 @@
 FROM node:16-bullseye-slim as base
 
 # Install openssl for Prisma
-# RUN apt-get update && apt-get install -y openssl
+# RUN apt-get update && apt-get install -y openssl sqlite3
 
 ENV NODE_ENV production
 
@@ -12,7 +12,7 @@ FROM base as deps
 RUN mkdir /app
 WORKDIR /app
 
-ADD package.json package-lock.json ./
+ADD package.json ./
 RUN npm install --production=false
 
 # Setup production node_modules
@@ -22,7 +22,7 @@ RUN mkdir /app
 WORKDIR /app
 
 COPY --from=deps /app/node_modules /app/node_modules
-ADD package.json package-lock.json ./
+ADD package.json ./
 RUN npm prune --production
 
 # Build the app
@@ -44,6 +44,12 @@ RUN npm run build
 FROM base
 
 ENV NODE_ENV production
+# Uncomment if using Prisma
+# ENV DATABASE_URL file:/data/sqlite.db
+# ENV PORT 8080
+#
+# # add shortcut for connecting to database CLI
+# RUN echo "#!/bin/sh\nset -x\nsqlite3 \$DATABASE_URL" > /usr/local/bin/database-cli && chmod +x /usr/local/bin/database-cli
 
 RUN mkdir /app
 WORKDIR /app
@@ -53,7 +59,10 @@ COPY --from=production-deps /app/node_modules /app/node_modules
 # COPY --from=build /app/node_modules/.prisma /app/node_modules/.prisma
 COPY --from=build /app/build /app/build
 COPY --from=build /app/public /app/public
-ADD . .
+COPY --from=build /app/package.json /app/package.json
+COPY --from=build /app/start.sh /app/start.sh
+# Uncomment if using Prisma
+# COPY --from=build /app/prisma /app/prisma
 
 ENV PORT 8080
-CMD ["npm", "run", "start"]
+ENTRYPOINT ["./start.sh"]

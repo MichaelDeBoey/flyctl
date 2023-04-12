@@ -17,7 +17,7 @@ func configureRemix(sourceDir string, config *ScannerConfig) (*SourceInfo, error
 	if checksPass(sourceDir+"/prisma", dirContains("*.prisma", "sqlite")) {
 		env["DATABASE_URL"] = "file:/data/sqlite.db"
 		s.Files = templates("templates/remix_prisma")
-		s.DockerCommand = "start_with_migrations.sh"
+		s.DockerCommand = "start.sh"
 		s.DockerEntrypoint = "sh"
 		s.SkipDatabase = true
 		s.Volumes = []Volume{

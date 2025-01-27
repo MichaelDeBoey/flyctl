@@ -5,15 +5,15 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+	fly "github.com/superfly/fly-go"
 	"github.com/superfly/flyctl/agent"
-	"github.com/superfly/flyctl/api"
-	"github.com/superfly/flyctl/client"
 	"github.com/superfly/flyctl/flypg"
 	"github.com/superfly/flyctl/internal/appconfig"
 	"github.com/superfly/flyctl/internal/command"
 	"github.com/superfly/flyctl/internal/command/apps"
 	"github.com/superfly/flyctl/internal/config"
 	"github.com/superfly/flyctl/internal/flag"
+	"github.com/superfly/flyctl/internal/flyutil"
 	mach "github.com/superfly/flyctl/internal/machine"
 	"github.com/superfly/flyctl/internal/render"
 	"github.com/superfly/flyctl/iostreams"
@@ -33,7 +33,6 @@ func newUsers() *cobra.Command {
 		newListUsers(),
 	)
 
-	flag.Add(cmd, flag.JSONOutput())
 	return cmd
 }
 
@@ -56,6 +55,7 @@ func newListUsers() *cobra.Command {
 		cmd,
 		flag.App(),
 		flag.AppConfig(),
+		flag.JSONOutput(),
 	)
 
 	return cmd
@@ -63,7 +63,7 @@ func newListUsers() *cobra.Command {
 
 func runListUsers(ctx context.Context) error {
 	var (
-		client  = client.FromContext(ctx).API()
+		client  = flyutil.ClientFromContext(ctx)
 		appName = appconfig.NameFromContext(ctx)
 	)
 
@@ -80,18 +80,10 @@ func runListUsers(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-
-	switch app.PlatformVersion {
-	case "machines":
-		return runMachineListUsers(ctx, app)
-	case "nomad":
-		return runNomadListUsers(ctx, app)
-	default:
-		return fmt.Errorf("unknown platform version")
-	}
+	return runMachineListUsers(ctx, app)
 }
 
-func runMachineListUsers(ctx context.Context, app *api.AppCompact) (err error) {
+func runMachineListUsers(ctx context.Context, app *fly.AppCompact) (err error) {
 	// Minimum image version requirements
 	var (
 		MinPostgresHaVersion         = "0.0.19"
@@ -104,7 +96,7 @@ func runMachineListUsers(ctx context.Context, app *api.AppCompact) (err error) {
 		return fmt.Errorf("machines could not be retrieved %w", err)
 	}
 
-	if err := hasRequiredVersionOnMachines(machines, MinPostgresHaVersion, MinPostgresFlexVersion, MinPostgresStandaloneVersion); err != nil {
+	if err := hasRequiredVersionOnMachines(app.Name, machines, MinPostgresHaVersion, MinPostgresFlexVersion, MinPostgresStandaloneVersion); err != nil {
 		return err
 	}
 
@@ -114,37 +106,6 @@ func runMachineListUsers(ctx context.Context, app *api.AppCompact) (err error) {
 	}
 
 	return renderUsers(ctx, leader.PrivateIP)
-}
-
-func runNomadListUsers(ctx context.Context, app *api.AppCompact) (err error) {
-	var (
-		MinPostgresHaVersion = "0.0.19"
-		client               = client.FromContext(ctx).API()
-	)
-
-	if err := hasRequiredVersionOnNomad(app, MinPostgresHaVersion, MinPostgresHaVersion); err != nil {
-		return err
-	}
-
-	agentclient, err := agent.Establish(ctx, client)
-	if err != nil {
-		return fmt.Errorf("failed to establish agent: %w", err)
-	}
-
-	pgInstances, err := agentclient.Instances(ctx, app.Organization.Slug, app.Name)
-	if err != nil {
-		return fmt.Errorf("failed to lookup 6pn ip for %s app: %v", app.Name, err)
-	}
-	if len(pgInstances.Addresses) == 0 {
-		return fmt.Errorf("no 6pn ips found for %s app", app.Name)
-	}
-
-	leaderIP, err := leaderIpFromNomadInstances(ctx, pgInstances.Addresses)
-	if err != nil {
-		return err
-	}
-
-	return renderUsers(ctx, leaderIP)
 }
 
 func renderUsers(ctx context.Context, leaderIP string) error {
@@ -170,7 +131,7 @@ func renderUsers(ctx context.Context, leaderIP string) error {
 		return render.JSON(io.Out, users)
 	}
 
-	rows := make([][]string, len(users))
+	rows := make([][]string, 0, len(users))
 
 	for _, user := range users {
 		var databases string

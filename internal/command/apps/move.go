@@ -5,10 +5,11 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+	"github.com/superfly/flyctl/internal/command/deploy/statics"
 	"github.com/superfly/flyctl/internal/flag/completion"
+	"github.com/superfly/flyctl/internal/flyutil"
 
-	"github.com/superfly/flyctl/api"
-	"github.com/superfly/flyctl/client"
+	fly "github.com/superfly/fly-go"
 	"github.com/superfly/flyctl/internal/command"
 	"github.com/superfly/flyctl/internal/flag"
 	"github.com/superfly/flyctl/internal/logger"
@@ -19,11 +20,11 @@ import (
 
 func newMove() *cobra.Command {
 	const (
-		long = `The APPS MOVE command will move an application to another
+		long = `Move an application to another
 organization the current user belongs to.
-`
-		short = "Move an app to another organization"
-		usage = "move <APPNAME>"
+For details, see https://fly.io/docs/apps/move-app-org/.`
+		short = "Move an app to another organization."
+		usage = "move <app name>"
 	)
 
 	move := command.New(usage, short, long, RunMove,
@@ -37,7 +38,7 @@ organization the current user belongs to.
 		flag.Org(),
 		flag.Bool{
 			Name:        "skip-health-checks",
-			Description: "Update machines without waiting for health checks. (Machines only)",
+			Description: "Update machines without waiting for health checks",
 			Default:     false,
 		},
 	)
@@ -51,13 +52,13 @@ organization the current user belongs to.
 func RunMove(ctx context.Context) error {
 	var (
 		appName  = flag.FirstArg(ctx)
-		client   = client.FromContext(ctx).API()
+		client   = flyutil.ClientFromContext(ctx)
 		io       = iostreams.FromContext(ctx)
 		colorize = io.ColorScheme()
 		logger   = logger.FromContext(ctx)
 	)
 
-	app, err := client.GetAppCompact(ctx, appName)
+	app, err := client.GetApp(ctx, appName)
 	if err != nil {
 		return fmt.Errorf("failed fetching app: %w", err)
 	}
@@ -91,45 +92,50 @@ Please confirm whether you wish to restart this app now.`
 		}
 	}
 
-	// Run machine specific migration process.
-	if app.PlatformVersion == "machines" {
-		return runMoveAppOnMachines(ctx, app, org)
-	}
-
-	_, err = client.MoveApp(ctx, appName, org.ID)
-	if err != nil {
-		return fmt.Errorf("failed moving app: %w", err)
-	}
-
-	fmt.Fprintf(io.Out, "successfully moved %s to %s\n", appName, org.Slug)
-
-	return nil
+	return runMoveAppOnMachines(ctx, app, org)
 }
 
-func runMoveAppOnMachines(ctx context.Context, app *api.AppCompact, targetOrg *api.Organization) error {
+func runMoveAppOnMachines(ctx context.Context, app *fly.App, targetOrg *fly.Organization) error {
 	var (
-		client           = client.FromContext(ctx).API()
+		client           = flyutil.ClientFromContext(ctx)
 		io               = iostreams.FromContext(ctx)
 		skipHealthChecks = flag.GetBool(ctx, "skip-health-checks")
 	)
 
-	ctx, err := BuildContext(ctx, app)
+	ctx, err := BuildContext(ctx, app.Compact())
 	if err != nil {
 		return err
 	}
 
 	machines, releaseLeaseFunc, err := mach.AcquireAllLeases(ctx)
-	defer releaseLeaseFunc(ctx, machines)
+	defer releaseLeaseFunc()
 	if err != nil {
 		return err
+	}
+
+	oldOrg, err := client.GetOrganizationBySlug(ctx, app.Organization.Slug)
+	if err != nil {
+		return fmt.Errorf("failed to find app's original organization: %w", err)
+	}
+
+	oldStaticsBucket, err := statics.FindBucket(ctx, app, oldOrg)
+	if err != nil {
+		return fmt.Errorf("failed to find app's original statics bucket: %w", err)
 	}
 
 	if _, err := client.MoveApp(ctx, app.Name, targetOrg.ID); err != nil {
 		return fmt.Errorf("failed moving app: %w", err)
 	}
 
+	if oldStaticsBucket != nil {
+		err := statics.MoveBucket(ctx, oldStaticsBucket, oldOrg, app, targetOrg, machines)
+		if err != nil {
+			return fmt.Errorf("failed to move statics bucket: %w", err)
+		}
+	}
+
 	for _, machine := range machines {
-		input := &api.LaunchMachineInput{
+		input := &fly.LaunchMachineInput{
 			Name:             machine.Name,
 			Region:           machine.Region,
 			Config:           machine.Config,

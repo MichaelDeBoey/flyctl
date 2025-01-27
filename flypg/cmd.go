@@ -4,13 +4,14 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 
+	fly "github.com/superfly/fly-go"
 	"github.com/superfly/flyctl/agent"
-	"github.com/superfly/flyctl/api"
-	"github.com/superfly/flyctl/client"
 	"github.com/superfly/flyctl/internal/command/ssh"
 	"github.com/superfly/flyctl/internal/flag"
+	"github.com/superfly/flyctl/internal/flyutil"
 	"github.com/superfly/flyctl/iostreams"
 )
 
@@ -26,20 +27,20 @@ type commandResponse struct {
 
 type Command struct {
 	ctx    context.Context
-	app    *api.AppCompact
+	app    *fly.AppCompact
 	dialer agent.Dialer
 	io     *iostreams.IOStreams
 }
 
-func NewCommand(ctx context.Context, app *api.AppCompact) (*Command, error) {
-	client := client.FromContext(ctx).API()
+func NewCommand(ctx context.Context, app *fly.AppCompact) (*Command, error) {
+	client := flyutil.ClientFromContext(ctx)
 
 	agentclient, err := agent.Establish(ctx, client)
 	if err != nil {
 		return nil, fmt.Errorf("error establishing agent: %w", err)
 	}
 
-	dialer, err := agentclient.Dialer(ctx, app.Organization.Slug)
+	dialer, err := agentclient.Dialer(ctx, app.Organization.Slug, "")
 	if err != nil {
 		return nil, fmt.Errorf("ssh: can't build tunnel for %s: %s", app.Organization.Slug, err)
 	}
@@ -73,14 +74,14 @@ func (pc *Command) UpdateSettings(ctx context.Context, leaderIp string, config m
 	}
 
 	if !result.Success {
-		return fmt.Errorf(result.Message)
+		return errors.New(result.Message)
 	}
 
 	return nil
 }
 
-func (pc *Command) UnregisterMember(ctx context.Context, leaderIP string, standbyIP string) error {
-	payload := encodeCommand(standbyIP)
+func (pc *Command) UnregisterMember(ctx context.Context, leaderIP string, standbyNodeName string) error {
+	payload := encodeCommand(standbyNodeName)
 	cmd := fmt.Sprintf("pg_unregister %s", payload)
 
 	resp, err := ssh.RunSSHCommand(ctx, pc.app, pc.dialer, leaderIP, cmd, ssh.DefaultSshUsername)
@@ -94,7 +95,7 @@ func (pc *Command) UnregisterMember(ctx context.Context, leaderIP string, standb
 	}
 
 	if !result.Success {
-		return fmt.Errorf(result.Message)
+		return errors.New(result.Message)
 	}
 
 	return nil

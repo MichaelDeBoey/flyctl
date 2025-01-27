@@ -1,36 +1,50 @@
 name: Checks
 
 on:
+  workflow_dispatch:
   pull_request:
   push:
     branches: [master]
 
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-$${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
-  lint:
+  precommit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-go@v4
+      - uses: actions/checkout@v4
+      # Install Go since pre-commit below runs "go mod tidy".
+      - uses: actions/setup-go@v5
         with:
           go-version-file: "go.mod"
-      - uses: pre-commit/action@v3.0.0
+          check-latest: true
+      # pre-commit runs "pip install" which doesn't work under Debian's apt-instaled Python.
+      # https://packaging.python.org/en/latest/specifications/externally-managed-environments/#externally-managed-environments
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: pre-commit/action@v3.0.1
         with:
           extra_args: --all-files --hook-stage=manual
-      - uses: golangci/golangci-lint-action@v3
-        with:
-          version: v1.52
-          # https://github.com/golangci/golangci-lint-action/issues/244
-          # precommit step already run go get and conflicts with golangci cache
-          skip-cache: true
 
-  lint-api:
+  lint:
+    strategy:
+      fail-fast: false
+    name: lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-go@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
-          go-version-file: "api/go.mod"
-      - uses: golangci/golangci-lint-action@v3
+          go-version-file: "go.mod"
+          # check-latest: true
+      - uses: golangci/golangci-lint-action@v6
         with:
-          version: v1.52
-          working-directory: "api"
+          version: v1.61.0
+          working-directory: .

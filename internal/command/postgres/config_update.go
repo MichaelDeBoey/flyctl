@@ -6,17 +6,16 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/pkg/errors"
 	"github.com/r3labs/diff"
 	"github.com/spf13/cobra"
+	fly "github.com/superfly/fly-go"
 	"github.com/superfly/flyctl/agent"
-	"github.com/superfly/flyctl/api"
-	"github.com/superfly/flyctl/client"
 	"github.com/superfly/flyctl/flypg"
 	"github.com/superfly/flyctl/internal/appconfig"
 	"github.com/superfly/flyctl/internal/command"
 	"github.com/superfly/flyctl/internal/command/apps"
 	"github.com/superfly/flyctl/internal/flag"
+	"github.com/superfly/flyctl/internal/flyutil"
 	mach "github.com/superfly/flyctl/internal/machine"
 	"github.com/superfly/flyctl/internal/prompt"
 	"github.com/superfly/flyctl/internal/render"
@@ -71,6 +70,14 @@ func newConfigUpdate() (cmd *cobra.Command) {
 			Name:        "shared-preload-libraries",
 			Description: "Sets the shared libraries to preload. (comma separated string)",
 		},
+		flag.String{
+			Name:        "work-mem",
+			Description: "Sets the maximum amount of memory each Postgres query can use",
+		},
+		flag.String{
+			Name:        "maintenance-work-mem",
+			Description: "Sets the maximum amount of memory used for maintenance operations like ALTER TABLE, CREATE INDEX, and VACUUM",
+		},
 		flag.Bool{
 			Name:        "force",
 			Description: "Skips pg-setting value verification.",
@@ -83,7 +90,7 @@ func newConfigUpdate() (cmd *cobra.Command) {
 
 func runConfigUpdate(ctx context.Context) error {
 	var (
-		client  = client.FromContext(ctx).API()
+		client  = flyutil.ClientFromContext(ctx)
 		appName = appconfig.NameFromContext(ctx)
 	)
 
@@ -100,18 +107,10 @@ func runConfigUpdate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-
-	switch app.PlatformVersion {
-	case "machines":
-		return runMachineConfigUpdate(ctx, app)
-	case "nomad":
-		return runNomadConfigUpdate(ctx, app)
-	default:
-		return fmt.Errorf("unknown platform version")
-	}
+	return runMachineConfigUpdate(ctx, app)
 }
 
-func runMachineConfigUpdate(ctx context.Context, app *api.AppCompact) error {
+func runMachineConfigUpdate(ctx context.Context, app *fly.AppCompact) error {
 	var (
 		io          = iostreams.FromContext(ctx)
 		colorize    = io.ColorScheme()
@@ -123,12 +122,12 @@ func runMachineConfigUpdate(ctx context.Context, app *api.AppCompact) error {
 	)
 
 	machines, releaseLeaseFunc, err := mach.AcquireAllLeases(ctx)
-	defer releaseLeaseFunc(ctx, machines)
+	defer releaseLeaseFunc()
 	if err != nil {
 		return fmt.Errorf("machines could not be retrieved")
 	}
 
-	if err := hasRequiredVersionOnMachines(machines, MinPostgresHaVersion, MinPostgresFlexVersion, MinPostgresStandaloneVersion); err != nil {
+	if err := hasRequiredVersionOnMachines(app.Name, machines, MinPostgresHaVersion, MinPostgresFlexVersion, MinPostgresStandaloneVersion); err != nil {
 		return err
 	}
 
@@ -175,8 +174,8 @@ func runMachineConfigUpdate(ctx context.Context, app *api.AppCompact) error {
 		}
 
 		// Ensure leases are released before we issue restart.
-		releaseLeaseFunc(ctx, machines)
-		if err := machinesRestart(ctx, &api.RestartMachineInput{}); err != nil {
+		releaseLeaseFunc()
+		if err := machinesRestart(ctx, app.Name, &fly.RestartMachineInput{}); err != nil {
 			return err
 		}
 	}
@@ -184,7 +183,7 @@ func runMachineConfigUpdate(ctx context.Context, app *api.AppCompact) error {
 	return nil
 }
 
-func updateStolonConfig(ctx context.Context, app *api.AppCompact, leaderIP string) (bool, error) {
+func updateStolonConfig(ctx context.Context, app *fly.AppCompact, leaderIP string) (bool, error) {
 	io := iostreams.FromContext(ctx)
 
 	restartRequired, changes, err := resolveConfigChanges(ctx, app, flypg.StolonManager, leaderIP)
@@ -207,7 +206,7 @@ func updateStolonConfig(ctx context.Context, app *api.AppCompact, leaderIP strin
 	return restartRequired, nil
 }
 
-func updateFlexConfig(ctx context.Context, app *api.AppCompact, leaderIP string) (bool, error) {
+func updateFlexConfig(ctx context.Context, app *fly.AppCompact, leaderIP string) (bool, error) {
 	var (
 		io     = iostreams.FromContext(ctx)
 		dialer = agent.DialerFromContext(ctx)
@@ -233,6 +232,10 @@ func updateFlexConfig(ctx context.Context, app *api.AppCompact, leaderIP string)
 
 	// Sync configuration settings for each node. This should be safe to apply out-of-order.
 	for _, machine := range machines {
+		if machine.Config.Env["IS_BARMAN"] != "" {
+			continue
+		}
+
 		client := flypg.NewFromInstance(machine.PrivateIP, dialer)
 
 		// Pull configuration settings down from Consul for each node and reload the config.
@@ -246,13 +249,13 @@ func updateFlexConfig(ctx context.Context, app *api.AppCompact, leaderIP string)
 	return restartRequired, nil
 }
 
-func resolveConfigChanges(ctx context.Context, app *api.AppCompact, manager string, leaderIP string) (bool, map[string]string, error) {
+func resolveConfigChanges(ctx context.Context, app *fly.AppCompact, manager string, leaderIP string) (bool, map[string]string, error) {
 	var (
 		io     = iostreams.FromContext(ctx)
 		dialer = agent.DialerFromContext(ctx)
 
 		force       = flag.GetBool(ctx, "force")
-		autoConfirm = flag.GetBool(ctx, "yes")
+		autoConfirm = flag.GetYes(ctx)
 	)
 
 	// Identify requested configuration changes.
@@ -311,10 +314,10 @@ func resolveConfigChanges(ctx context.Context, app *api.AppCompact, manager stri
 			switch confirmed, err := prompt.Confirmf(ctx, msg); {
 			case err == nil:
 				if !confirmed {
-					return false, nil, nil
+					return false, nil, fmt.Errorf("cancelled")
 				}
 			case prompt.IsNonInteractive(err):
-				return false, nil, prompt.NonInteractiveError("auto-confirm flag must be specified when not running interactively")
+				return false, nil, prompt.NonInteractiveError("yes flag must be specified when not running interactively")
 			default:
 				return false, nil, err
 			}
@@ -357,67 +360,6 @@ func isRestartRequired(pgSettings *flypg.PGSettings, name string) bool {
 	}
 
 	return false
-}
-
-func runNomadConfigUpdate(ctx context.Context, app *api.AppCompact) error {
-	var (
-		client      = client.FromContext(ctx).API()
-		io          = iostreams.FromContext(ctx)
-		colorize    = io.ColorScheme()
-		autoConfirm = flag.GetBool(ctx, "yes")
-
-		MinPostgresVersion = "v0.0.32"
-	)
-
-	if err := hasRequiredVersionOnNomad(app, MinPostgresVersion, MinPostgresVersion); err != nil {
-		return err
-	}
-
-	agentclient, err := agent.Establish(ctx, client)
-	if err != nil {
-		return errors.Wrap(err, "can't establish agent")
-	}
-
-	pgInstances, err := agentclient.Instances(ctx, app.Organization.Slug, app.Name)
-	if err != nil {
-		return fmt.Errorf("failed to lookup 6pn ip for %s app: %v", app.Name, err)
-	}
-	if len(pgInstances.Addresses) == 0 {
-		return fmt.Errorf("no 6pn ips found for %s app", app.Name)
-	}
-
-	leaderIP, err := leaderIpFromNomadInstances(ctx, pgInstances.Addresses)
-	if err != nil {
-		return err
-	}
-
-	requiresRestart, err := updateStolonConfig(ctx, app, leaderIP)
-	if err != nil {
-		return err
-	}
-
-	if requiresRestart {
-		if !autoConfirm {
-			fmt.Fprintln(io.Out, colorize.Yellow("Please note that some of your changes will require a cluster restart before they will be applied."))
-
-			switch confirmed, err := prompt.Confirm(ctx, "Restart cluster now?"); {
-			case err == nil:
-				if !confirmed {
-					return nil
-				}
-			case prompt.IsNonInteractive(err):
-				return prompt.NonInteractiveError("yes flag must be specified when not running interactively")
-			default:
-				return err
-			}
-		}
-
-		if err := nomadRestart(ctx, app); err != nil {
-			return err
-		}
-	}
-
-	return nil
 }
 
 func validateConfigValue(setting flypg.PGSetting, key, val string) error {

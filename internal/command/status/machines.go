@@ -4,46 +4,43 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 
-	"github.com/superfly/flyctl/api"
-	"github.com/superfly/flyctl/client"
-	"github.com/superfly/flyctl/flaps"
+	fly "github.com/superfly/fly-go"
+	"github.com/superfly/fly-go/flaps"
 	"github.com/superfly/flyctl/internal/command/postgres"
 	"github.com/superfly/flyctl/internal/config"
+	"github.com/superfly/flyctl/internal/flapsutil"
+	"github.com/superfly/flyctl/internal/flyutil"
 	"github.com/superfly/flyctl/internal/render"
 	"github.com/superfly/flyctl/iostreams"
-	"golang.org/x/exp/slices"
 )
 
-func getFromMetadata(m *api.Machine, key string) string {
-	if m.Config != nil && m.Config.Metadata != nil {
-		return m.Config.Metadata[key]
-	}
-
-	return ""
-}
-
-func getProcessgroup(m *api.Machine) string {
+func getProcessgroup(m *fly.Machine) string {
 	name := m.ProcessGroup()
 	if name == "" {
 		name = "<default>"
 	}
 
-	if len(m.Config.Standbys) > 0 {
+	if len(m.GetConfig().Standbys) > 0 {
 		name += "†"
+	}
+
+	if m.HostStatus != fly.HostStatusOk {
+		name += "💀"
 	}
 	return name
 }
 
-func getReleaseVersion(m *api.Machine) string {
-	return getFromMetadata(m, api.MachineConfigMetadataKeyFlyReleaseVersion)
+func getReleaseVersion(m *fly.Machine) string {
+	return m.GetMetadataByKey(fly.MachineConfigMetadataKeyFlyReleaseVersion)
 }
 
 // getImage returns the image on the most recent machine released under an app.
-func getImage(machines []*api.Machine) (string, error) {
+func getImage(machines []*fly.Machine) (string, error) {
 	// for context, see this comment https://github.com/superfly/flyctl/pull/1709#discussion_r1110466239
 	versionToImage := map[int]string{}
 	for _, machine := range machines {
@@ -72,15 +69,18 @@ func getImage(machines []*api.Machine) (string, error) {
 	return latestImage, nil
 }
 
-func RenderMachineStatus(ctx context.Context, app *api.AppCompact, out io.Writer) error {
+func RenderMachineStatus(ctx context.Context, app *fly.AppCompact, out io.Writer) error {
 	var (
 		io         = iostreams.FromContext(ctx)
 		colorize   = io.ColorScheme()
-		client     = client.FromContext(ctx).API()
+		client     = flyutil.ClientFromContext(ctx)
 		jsonOutput = config.FromContext(ctx).JSONOutput
 	)
 
-	flapsClient, err := flaps.New(ctx, app)
+	flapsClient, err := flapsutil.NewClientWithOptions(ctx, flaps.NewClientOpts{
+		AppCompact: app,
+		AppName:    app.Name,
+	})
 	if err != nil {
 		return err
 	}
@@ -103,16 +103,23 @@ func RenderMachineStatus(ctx context.Context, app *api.AppCompact, out io.Writer
 	}
 
 	// Tracks latest eligible version
-	var latest *api.ImageVersion
+	var latest *fly.ImageVersion
 
-	var updatable []*api.Machine
+	var updatable []*fly.Machine
+
+	unknownRepos := map[string]bool{}
 
 	for _, machine := range machines {
 		image := fmt.Sprintf("%s:%s", machine.ImageRef.Repository, machine.ImageRef.Tag)
+		// Skip API call for already-seen unknown repos, or default deploy-label prefix.
+		if unknownRepos[image] || strings.HasPrefix(machine.ImageRef.Tag, "deployment-") {
+			continue
+		}
 
-		latestImage, err := client.GetLatestImageDetails(ctx, image)
+		latestImage, err := client.GetLatestImageDetails(ctx, image, machine.ImageVersion())
 		if err != nil {
 			if strings.Contains(err.Error(), "Unknown repository") {
+				unknownRepos[image] = true
 				continue
 			}
 			return fmt.Errorf("unable to fetch latest image details for %s: %w", image, err)
@@ -142,7 +149,7 @@ func RenderMachineStatus(ctx context.Context, app *api.AppCompact, out io.Writer
 		fmt.Fprintln(out, colorize.Yellow("Run `flyctl image update` to migrate to the latest image version."))
 	}
 
-	managed, unmanaged := []*api.Machine{}, []*api.Machine{}
+	managed, unmanaged := []*fly.Machine{}, []*fly.Machine{}
 
 	for _, machine := range machines {
 		if machine.IsAppsV2() {
@@ -157,17 +164,27 @@ func RenderMachineStatus(ctx context.Context, app *api.AppCompact, out io.Writer
 		return err
 	}
 
-	obj := [][]string{{app.Name, app.Organization.Slug, app.Hostname, image, app.PlatformVersion}}
-	if err := render.VerticalTable(out, "App", obj, "Name", "Owner", "Hostname", "Image", "Platform"); err != nil {
+	obj := [][]string{{app.Name, app.Organization.Slug, app.Hostname, image}}
+	if err := render.VerticalTable(out, "App", obj, "Name", "Owner", "Hostname", "Image"); err != nil {
 		return err
 	}
 
 	if len(managed) > 0 {
 		hasStandbys := false
+		hasNotOk := false
 		rows := [][]string{}
 		for _, machine := range managed {
-			if len(machine.Config.Standbys) > 0 {
+			mConfig := machine.GetConfig()
+			if len(mConfig.Standbys) > 0 {
 				hasStandbys = true
+			}
+			if machine.HostStatus != fly.HostStatusOk {
+				hasNotOk = true
+			}
+			var role string
+
+			if v := mConfig.Metadata["role"]; v != "" {
+				role = v
 			}
 			rows = append(rows, []string{
 				getProcessgroup(machine),
@@ -175,6 +192,7 @@ func RenderMachineStatus(ctx context.Context, app *api.AppCompact, out io.Writer
 				getReleaseVersion(machine),
 				machine.Region,
 				machine.State,
+				role,
 				render.MachineHealthChecksSummary(machine),
 				machine.UpdatedAt,
 			})
@@ -184,28 +202,34 @@ func RenderMachineStatus(ctx context.Context, app *api.AppCompact, out io.Writer
 			return slices.Compare(rows[i], rows[j]) < 0
 		})
 
-		err := render.Table(out, "Machines", rows, "Process", "ID", "Version", "Region", "State", "Checks", "Last Updated")
+		err := render.Table(out, "Machines", rows, "Process", "ID", "Version", "Region", "State", "Role", "Checks", "Last Updated")
 		if err != nil {
 			return err
 		}
 
+		if hasStandbys || hasNotOk {
+			fmt.Fprint(out, "Notes:\n")
+		}
 		if hasStandbys {
 			fmt.Fprintf(out, "  † Standby machine (it will take over only in case of host hardware failure)\n")
+		}
+		if hasNotOk {
+			fmt.Fprintf(out, "  💀 The machine's host is unreachable\n")
 		}
 	}
 
 	if len(unmanaged) > 0 {
-		msg := fmt.Sprintf("Found machines that aren't part of the Fly Apps Platform, run %s to see them.\n", io.ColorScheme().Yellow("fly machines list"))
+		msg := fmt.Sprintf("Found machines that aren't part of Fly Launch, run %s to see them.\n", io.ColorScheme().Yellow("fly machines list"))
 		fmt.Fprint(out, msg)
 	}
 
 	return nil
 }
 
-func renderMachineJSONStatus(ctx context.Context, app *api.AppCompact, machines []*api.Machine) error {
+func renderMachineJSONStatus(ctx context.Context, app *fly.AppCompact, machines []*fly.Machine) error {
 	var (
 		out    = iostreams.FromContext(ctx).Out
-		client = client.FromContext(ctx).API()
+		client = flyutil.ClientFromContext(ctx)
 	)
 
 	versionQuery := `
@@ -228,7 +252,7 @@ func renderMachineJSONStatus(ctx context.Context, app *api.AppCompact, machines 
 		version = resp.App.CurrentRelease.Version
 	}
 
-	machinesToShow := []*api.Machine{}
+	machinesToShow := []*fly.Machine{}
 	if app.IsPostgresApp() {
 		machinesToShow = machines
 	} else {
@@ -254,18 +278,18 @@ func renderMachineJSONStatus(ctx context.Context, app *api.AppCompact, machines 
 	return render.JSON(out, status)
 }
 
-func renderPGStatus(ctx context.Context, app *api.AppCompact, machines []*api.Machine, out io.Writer) (err error) {
+func renderPGStatus(ctx context.Context, app *fly.AppCompact, machines []*fly.Machine, out io.Writer) (err error) {
 	var (
 		io       = iostreams.FromContext(ctx)
 		colorize = io.ColorScheme()
-		client   = client.FromContext(ctx).API()
+		client   = flyutil.ClientFromContext(ctx)
 	)
 
 	if len(machines) > 0 {
 		if postgres.IsFlex(machines[0]) {
 			yes, note := isQuorumMet(machines)
 			if !yes {
-				fmt.Fprintf(out, colorize.Yellow(note))
+				fmt.Fprint(out, colorize.Yellow(note))
 			}
 		}
 	} else {
@@ -274,13 +298,13 @@ func renderPGStatus(ctx context.Context, app *api.AppCompact, machines []*api.Ma
 	}
 
 	// Tracks latest eligible version
-	var latest *api.ImageVersion
-	var updatable []*api.Machine
+	var latest *fly.ImageVersion
+	var updatable []*fly.Machine
 
 	for _, machine := range machines {
 		image := fmt.Sprintf("%s:%s", machine.ImageRef.Repository, machine.ImageRef.Tag)
 
-		latestImage, err := client.GetLatestImageDetails(ctx, image)
+		latestImage, err := client.GetLatestImageDetails(ctx, image, machine.ImageVersion())
 
 		if err != nil && strings.Contains(err.Error(), "Unknown repository") {
 			continue
@@ -323,7 +347,7 @@ func renderPGStatus(ctx context.Context, app *api.AppCompact, machines []*api.Ma
 		role := "unknown"
 		for _, check := range machine.Checks {
 			if check.Name == "role" {
-				if check.Status == api.Passing {
+				if check.Status == fly.Passing {
 					role = check.Output
 				} else {
 					role = "error"
@@ -346,7 +370,7 @@ func renderPGStatus(ctx context.Context, app *api.AppCompact, machines []*api.Ma
 	return render.Table(out, "", rows, "ID", "State", "Role", "Region", "Checks", "Image", "Created", "Updated")
 }
 
-func isQuorumMet(machines []*api.Machine) (bool, string) {
+func isQuorumMet(machines []*fly.Machine) (bool, string) {
 	primaryRegion := machines[0].Config.Env["PRIMARY_REGION"]
 
 	// We are only considering machines in the primary region.

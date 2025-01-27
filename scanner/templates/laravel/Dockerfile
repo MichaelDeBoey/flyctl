@@ -20,10 +20,18 @@ RUN composer install --optimize-autoloader --no-dev \
     && mkdir -p storage/logs \
     && php artisan optimize:clear \
     && chown -R www-data:www-data /var/www/html \
-    && sed -i 's/protected \$proxies/protected \$proxies = "*"/g' app/Http/Middleware/TrustProxies.php \
     && echo "MAILTO=\"\"\n* * * * * www-data /usr/bin/php /var/www/html/artisan schedule:run" > /etc/cron.d/laravel \
     && cp .fly/entrypoint.sh /entrypoint \
     && chmod +x /entrypoint
+
+# Laravel 11 made changes to how trusting all proxies works, see https://laravel.com/docs/11.x/requests#trusting-all-proxies and https://laravel.com/docs/10.x/requests#trusting-all-proxies
+RUN if php artisan --version | grep -q "Laravel Framework 1[1-9]"; then \
+    sed -i='' '/->withMiddleware(function (Middleware \$middleware) {/a\
+        \$middleware->trustProxies(at: "*");\
+' bootstrap/app.php; \
+  else \
+    sed -i 's/protected \$proxies/protected \$proxies = "*"/g' app/Http/Middleware/TrustProxies.php; \
+fi
 
 # If we're using Octane...
 RUN if grep -Fq "laravel/octane" /var/www/html/composer.json; then \
@@ -64,7 +72,7 @@ RUN if [ -f "vite.config.js" ]; then \
         yarn install --frozen-lockfile; \
         yarn $ASSET_CMD; \
     elif [ -f "pnpm-lock.yaml" ]; then \
-        corepack enable && corepack prepare pnpm@latest-7 --activate; \
+        corepack enable && corepack prepare pnpm@latest-8 --activate; \
         pnpm install --frozen-lockfile; \
         pnpm run $ASSET_CMD; \
     elif [ -f "package-lock.json" ]; then \

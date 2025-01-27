@@ -10,25 +10,25 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/samber/lo"
-	"github.com/superfly/flyctl/api"
+	fly "github.com/superfly/fly-go"
 	"github.com/superfly/flyctl/internal/machine"
 	"github.com/superfly/flyctl/iostreams"
 	"github.com/superfly/flyctl/terminal"
 )
 
-func FromAppAndMachineSet(ctx context.Context, appCompact *api.AppCompact, machines machine.MachineSet) (*Config, string, error) {
+func FromAppAndMachineSet(ctx context.Context, appName string, machines machine.MachineSet) (*Config, string, error) {
 	var (
 		warnings                  []string
 		io                        = iostreams.FromContext(ctx)
 		colorize                  = io.ColorScheme()
 		tomlCounter               = newFreqCounter[*machineConfigPair]()
-		processGroups, warningMsg = processGroupsFromMachineSet(machines)
+		processGroups, warningMsg = processGroupsFromMachineSet(ctx, machines)
 	)
 	if warningMsg != "" {
 		warnings = append(warnings, warningMsg)
 	}
 	for _, m := range machines.GetMachines() {
-		appConfig, machineWarning := fromAppAndOneMachine(appCompact, m, processGroups)
+		appConfig, machineWarning := fromAppAndOneMachine(ctx, appName, m, processGroups)
 		warnings = append(warnings, machineWarning)
 		tomlString, err := appConfig.marshalTOML()
 		if err != nil {
@@ -87,7 +87,7 @@ func prettyDiff(original, new string, colorize *iostreams.ColorScheme) string {
 	return ""
 }
 
-func fromAppAndOneMachine(appCompact *api.AppCompact, m machine.LeasableMachine, processGroups *processGroupInfo) (*Config, string) {
+func fromAppAndOneMachine(ctx context.Context, appName string, m machine.LeasableMachine, processGroups *processGroupInfo) (*Config, string) {
 	var (
 		warningMsg     string
 		primaryRegion  string
@@ -103,8 +103,10 @@ func fromAppAndOneMachine(appCompact *api.AppCompact, m machine.LeasableMachine,
 	}
 	for _, s := range m.Machine().Config.Statics {
 		statics = append(statics, Static{
-			GuestPath: s.GuestPath,
-			UrlPrefix: s.UrlPrefix,
+			GuestPath:     s.GuestPath,
+			UrlPrefix:     s.UrlPrefix,
+			TigrisBucket:  s.TigrisBucket,
+			IndexDocument: s.IndexDocument,
 		})
 	}
 	if len(m.Machine().Config.Mounts) > 0 {
@@ -125,14 +127,16 @@ fly.toml only supports one mount per machine at this time. These mounts will be 
 	if len(m.Machine().Config.Checks) > 0 {
 		topLevelChecks = make(map[string]*ToplevelCheck)
 		for checkName, machineCheck := range m.Machine().Config.Checks {
-			topLevelChecks[checkName] = topLevelCheckFromMachineCheck(machineCheck)
+			topLevelChecks[checkName] = topLevelCheckFromMachineCheck(ctx, machineCheck)
 		}
 	}
 	cfg := NewConfig()
-	cfg.AppName = appCompact.Name
+	cfg.AppName = appName
 	cfg.PrimaryRegion = primaryRegion
 	cfg.Env = m.Machine().Config.Env
-	cfg.Metrics = m.Machine().Config.Metrics
+	cfg.Metrics = []*Metrics{
+		{MachineMetrics: m.Machine().Config.Metrics},
+	}
 	cfg.Statics = statics
 	cfg.Mounts = mounts
 	cfg.Processes = processGroups.processes
@@ -174,7 +178,7 @@ func quotePosixWords(words []string) []string {
 	return quoted
 }
 
-func processGroupsFromMachineSet(ms machine.MachineSet) (*processGroupInfo, string) {
+func processGroupsFromMachineSet(ctx context.Context, ms machine.MachineSet) (*processGroupInfo, string) {
 	var (
 		warningMsg     string
 		processGroups  = &processGroupInfo{}
@@ -194,7 +198,7 @@ func processGroupsFromMachineSet(ms machine.MachineSet) (*processGroupInfo, stri
 	report := counter.Report()
 	if report.mostCommon != "" {
 		processGroups.processes = make(map[string]string)
-		processGroups.processes[api.MachineProcessGroupApp] = report.mostCommon
+		processGroups.processes[fly.MachineProcessGroupApp] = report.mostCommon
 	}
 	if len(report.otherValues) > 0 {
 		var otherMachineIds []string
@@ -205,12 +209,12 @@ func processGroupsFromMachineSet(ms machine.MachineSet) (*processGroupInfo, stri
 		for _, cmd := range report.others {
 			otherCmds += fmt.Sprintf("    %s\n", cmd)
 		}
-		warningMsg += warning("processes", fmt.Sprintf(`Found these additional commands on some machines. Consider adding process groups to your fly.toml and run machines with those process groups.
+		warningMsg += warning("processes", `Found these additional commands on some machines. Consider adding process groups to your fly.toml and run machines with those process groups.
 For more info please see: https://fly.io/docs/reference/configuration/#the-processes-section
 Machine IDs that were not saved to fly.toml: %s
 Commands they are running:
 %s
-`, strings.Join(otherMachineIds, ", "), otherCmds))
+`, strings.Join(otherMachineIds, ", "), otherCmds)
 		warningMsg += "\n"
 	}
 
@@ -223,7 +227,7 @@ Commands they are running:
 	serviceReport := serviceCounter.Report()
 	processes := lo.Keys(processGroups.processes)
 	for _, service := range serviceReport.mostCommonValues[0].Machine().Config.Services {
-		processGroups.services = append(processGroups.services, *serviceFromMachineService(service, processes))
+		processGroups.services = append(processGroups.services, *serviceFromMachineService(ctx, service, processes))
 	}
 	if len(serviceReport.otherValues) > 0 {
 		var otherMachineIds []string

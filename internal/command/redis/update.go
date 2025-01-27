@@ -9,9 +9,9 @@ import (
 	"github.com/superfly/flyctl/gql"
 	"github.com/superfly/flyctl/iostreams"
 
-	"github.com/superfly/flyctl/client"
 	"github.com/superfly/flyctl/internal/command"
 	"github.com/superfly/flyctl/internal/flag"
+	"github.com/superfly/flyctl/internal/flyutil"
 	"github.com/superfly/flyctl/internal/prompt"
 )
 
@@ -28,6 +28,7 @@ func newUpdate() (cmd *cobra.Command) {
 	flag.Add(cmd,
 		flag.Org(),
 		flag.Region(),
+		flag.ReplicaRegions(),
 	)
 	cmd.Args = cobra.ExactArgs(1)
 	return cmd
@@ -36,12 +37,12 @@ func newUpdate() (cmd *cobra.Command) {
 func runUpdate(ctx context.Context) (err error) {
 	var (
 		out    = iostreams.FromContext(ctx).Out
-		client = client.FromContext(ctx).API().GenqClient
+		client = flyutil.ClientFromContext(ctx).GenqClient()
 	)
 
 	id := flag.FirstArg(ctx)
 
-	response, err := gql.GetAddOn(ctx, client, id)
+	response, err := gql.GetAddOn(ctx, client, id, string(gql.AddOnTypeUpstashRedis))
 	if err != nil {
 		return
 	}
@@ -49,30 +50,33 @@ func runUpdate(ctx context.Context) (err error) {
 	addOn := response.AddOn
 
 	excludedRegions, err := GetExcludedRegions(ctx)
-
 	if err != nil {
 		return err
 	}
 	excludedRegions = append(excludedRegions, addOn.PrimaryRegion)
 
-	readRegions, err := prompt.MultiRegion(ctx, "Choose replica regions, or unselect to remove replica regions:", !addOn.Organization.PaidPlan, addOn.ReadRegions, excludedRegions)
+	readRegions, err := prompt.MultiRegion(ctx, "Choose replica regions, or unselect to remove replica regions:", false, addOn.ReadRegions, excludedRegions, "replica-regions")
 	if err != nil {
 		return
 	}
 
 	var index int
 	var promptOptions []string
+	var promptDefault string
 
-	result, err := gql.ListAddOnPlans(ctx, client)
+	result, err := gql.ListAddOnPlans(ctx, client, gql.AddOnTypeUpstashRedis)
 	if err != nil {
 		return
 	}
 
 	for _, plan := range result.AddOnPlans.Nodes {
-		promptOptions = append(promptOptions, fmt.Sprintf("%s: %s Max Data Size, $%d/month/region", plan.DisplayName, plan.MaxDataSize, plan.PricePerMonth))
+		promptOptions = append(promptOptions, fmt.Sprintf("%s: %s", plan.DisplayName, plan.Description))
+		if addOn.AddOnPlan.Id == plan.Id {
+			promptDefault = fmt.Sprintf("%s: %s", plan.DisplayName, plan.Description)
+		}
 	}
 
-	err = prompt.Select(ctx, &index, "Select an Upstash Redis plan", "", promptOptions...)
+	err = prompt.Select(ctx, &index, "Select an Upstash Redis plan", promptDefault, promptOptions...)
 
 	if err != nil {
 		return fmt.Errorf("failed to select a plan: %w", err)
@@ -86,6 +90,15 @@ func runUpdate(ctx context.Context) (err error) {
 
 	options, _ := addOn.Options.(map[string]interface{})
 
+	if options == nil {
+		options = make(map[string]interface{})
+	}
+
+	metadata, _ := addOn.Metadata.(map[string]interface{})
+
+	if metadata == nil {
+		metadata = make(map[string]interface{})
+	}
 	if err != nil {
 		return
 	}
@@ -94,7 +107,6 @@ func runUpdate(ctx context.Context) (err error) {
 		if disableEviction, err := prompt.Confirm(ctx, " Would you like to disable eviction?"); disableEviction || err != nil {
 			options["eviction"] = false
 		}
-
 	} else {
 		options["eviction"], err = prompt.Confirm(ctx, " Would you like to enable eviction?")
 	}
@@ -103,23 +115,13 @@ func runUpdate(ctx context.Context) (err error) {
 		return
 	}
 
-	_ = `# @genqlient
-  mutation UpdateAddOn($addOnId: ID!, $planId: ID!, $readRegions: [String!]!, $options: JSON!) {
-		updateAddOn(input: {addOnId: $addOnId, planId: $planId, readRegions: $readRegions, options: $options}) {
-			addOn {
-				id
-			}
-		}
-  }
-	`
-
 	readRegionCodes := []string{}
 
 	for _, region := range *readRegions {
 		readRegionCodes = append(readRegionCodes, region.Code)
 	}
 
-	_, err = gql.UpdateAddOn(ctx, client, addOn.Id, result.AddOnPlans.Nodes[index].Id, readRegionCodes, options)
+	_, err = gql.UpdateAddOn(ctx, client, addOn.Id, result.AddOnPlans.Nodes[index].Id, readRegionCodes, options, metadata)
 
 	if err != nil {
 		return

@@ -2,16 +2,19 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/superfly/flyctl/api"
-	"github.com/superfly/flyctl/client"
+	fly "github.com/superfly/fly-go"
 	"github.com/superfly/flyctl/flypg"
 	"github.com/superfly/flyctl/internal/command"
 	"github.com/superfly/flyctl/internal/command/apps"
 	"github.com/superfly/flyctl/internal/flag"
+	"github.com/superfly/flyctl/internal/flapsutil"
+	"github.com/superfly/flyctl/internal/flyutil"
 	mach "github.com/superfly/flyctl/internal/machine"
 	"github.com/superfly/flyctl/internal/prompt"
 	"github.com/superfly/flyctl/iostreams"
@@ -19,7 +22,7 @@ import (
 
 func newCreate() *cobra.Command {
 	const (
-		short = "Create a new PostgreSQL cluster"
+		short = "Create a new Postgres cluster"
 		long  = short + "\n"
 	)
 
@@ -32,6 +35,11 @@ func newCreate() *cobra.Command {
 		flag.Region(),
 		flag.Org(),
 		flag.Detach(),
+		flag.VMSizeFlags,
+		flag.Bool{
+			Name:        "enable-backups",
+			Description: "Create a new tigris bucket and enable WAL-based backups",
+		},
 		flag.String{
 			Name:        "name",
 			Shorthand:   "n",
@@ -42,11 +50,6 @@ func newCreate() *cobra.Command {
 			Shorthand:   "p",
 			Description: "The superuser password. The password will be generated for you if you leave this blank",
 		},
-		flag.String{
-			Name:        "vm-size",
-			Description: "the size of the VM",
-		},
-
 		flag.Int{
 			Name:        "initial-cluster-size",
 			Description: "Initial cluster size",
@@ -66,12 +69,6 @@ func newCreate() *cobra.Command {
 		flag.String{
 			Name:        "fork-from",
 			Description: "Specify a source Postgres application to fork from. Format: <app-name> or <app-name>:<volume-id>",
-		},
-		flag.Bool{
-			Name:        "remote-fork",
-			Description: "Enables experimental cross-host volume forking",
-			Hidden:      true,
-			Default:     false,
 		},
 		flag.String{
 			Name:        "image-ref",
@@ -103,7 +100,7 @@ func newCreate() *cobra.Command {
 func run(ctx context.Context) (err error) {
 	var (
 		appName  = flag.GetString(ctx, "name")
-		client   = client.FromContext(ctx).API()
+		client   = flyutil.ClientFromContext(ctx)
 		io       = iostreams.FromContext(ctx)
 		colorize = io.ColorScheme()
 	)
@@ -117,7 +114,7 @@ func run(ctx context.Context) (err error) {
 		}
 	}
 
-	var org *api.Organization
+	var org *fly.Organization
 	org, err = prompt.Org(ctx)
 	if err != nil {
 		return
@@ -153,7 +150,7 @@ func run(ctx context.Context) (err error) {
 
 		// Initial cluster size may not be greater than 1 with fork-from
 		if pgConfig.InitialClusterSize > 1 {
-			fmt.Fprintf(io.Out, colorize.Yellow("Warning: --initial-cluster-size is ignored when specifying --fork-from\n"))
+			fmt.Fprint(io.Out, colorize.Yellow("Warning: --initial-cluster-size is ignored when specifying --fork-from\n"))
 			pgConfig.InitialClusterSize = 1
 		}
 
@@ -197,14 +194,21 @@ func run(ctx context.Context) (err error) {
 			params.ForkFrom = volID
 		}
 
+		flapsClient := flapsutil.ClientFromContext(ctx)
+
 		// Resolve the volume
-		vol, err := client.GetVolume(ctx, params.ForkFrom)
+		vol, err := flapsClient.GetVolume(ctx, params.ForkFrom)
 		if err != nil {
 			return fmt.Errorf("Failed to resolve the specified fork-from volume %s: %w", params.ForkFrom, err)
 		}
 
+		appName, err := client.GetAppNameFromVolume(ctx, vol.ID)
+		if err != nil {
+			return err
+		}
+
 		// Confirm that the volume is associated with the fork-from app
-		if vol.App.Name != forkApp.Name {
+		if *appName != forkApp.Name {
 			return fmt.Errorf("The volume %q specified must be associated with the fork-from app %q", vol.ID, forkApp.Name)
 		}
 
@@ -230,6 +234,11 @@ func run(ctx context.Context) (err error) {
 			return fmt.Errorf("The target volume size %dGB must be greater than or equal to the volume fork target: %dGB", pgConfig.DiskGb, vol.SizeGb)
 		}
 
+		// Attempt to resolve the image ref from the machine tied to the fork volume.
+		if pgConfig.ImageRef == "" {
+			pgConfig.ImageRef = resolveImageFromForkVolume(vol, machines)
+		}
+
 		// Resolve the fork-from app manager
 		params.Manager = resolveForkFromManager(ctx, machines)
 		params.ForkFrom = vol.ID
@@ -237,7 +246,7 @@ func run(ctx context.Context) (err error) {
 
 	params.PostgresConfiguration = *pgConfig
 
-	var region *api.Region
+	var region *fly.Region
 	region, err = prompt.Region(ctx, !org.PaidPlan, prompt.RegionParams{
 		Message: "",
 	})
@@ -257,38 +266,63 @@ func run(ctx context.Context) (err error) {
 }
 
 // CreateCluster creates a Postgres cluster with an optional name. The name will be prompted for if not supplied.
-func CreateCluster(ctx context.Context, org *api.Organization, region *api.Region, params *ClusterParams) (err error) {
+func CreateCluster(ctx context.Context, org *fly.Organization, region *fly.Region, params *ClusterParams) (err error) {
 	var (
-		client = client.FromContext(ctx).API()
+		client = flyutil.ClientFromContext(ctx)
 		io     = iostreams.FromContext(ctx)
 	)
 
 	input := &flypg.CreateClusterInput{
-		AppName:      params.Name,
-		Organization: org,
-		ImageRef:     params.ImageRef,
-		Region:       region.Code,
-		Manager:      params.Manager,
-		Autostart:    params.Autostart,
-		ForkFrom:     params.ForkFrom,
+		AppName:        params.Name,
+		Organization:   org,
+		ImageRef:       params.PostgresConfiguration.ImageRef,
+		Region:         region.Code,
+		Manager:        params.Manager,
+		Autostart:      params.Autostart,
+		ForkFrom:       params.ForkFrom,
+		BackupsEnabled: flag.GetBool(ctx, "enable-backups"),
+		// Eventually we populate this with a full S3 endpoint, but use the
+		// restore app target for now.
+		BarmanRemoteRestoreConfig: flag.GetString(ctx, "restore-target-app"),
 	}
 
-	customConfig := params.DiskGb != 0 || params.VMSize != "" || params.InitialClusterSize != 0
+	isCustomMachine := false
+	for _, sizeFlag := range flag.VMSizeFlags {
+		nameField := reflect.ValueOf(sizeFlag).FieldByName("Name")
+
+		if nameField.IsValid() {
+			name := nameField.String()
+			if name == "vm-size" {
+				continue
+			}
+
+			if flag.IsSpecified(ctx, name) {
+				isCustomMachine = true
+				break
+			}
+		}
+	}
+
+	customConfig := isCustomMachine || params.DiskGb != 0 || params.VMSize != "" || params.InitialClusterSize != 0 || params.ScaleToZero != nil
 
 	var config *PostgresConfiguration
 
-	if !customConfig {
-		fmt.Fprintf(io.Out, "For pricing information visit: https://fly.io/docs/about/pricing/#postgresql-clusters")
+	if !customConfig && input.BarmanRemoteRestoreConfig == "" {
+		fmt.Fprintf(io.Out, "For pricing information visit: https://fly.io/docs/about/pricing/")
 
 		msg := "Select configuration:"
+		configurations := postgresConfigurations(input.Manager)
 		var selected int
 
 		options := []string{}
-		for _, cfg := range postgresConfigurations(input.Manager) {
+		for i, cfg := range configurations {
 			options = append(options, cfg.Description)
+			if selected == 0 && !strings.HasPrefix(cfg.Description, "Dev") {
+				selected = i
+			}
 		}
 
-		if err := prompt.Select(ctx, &selected, msg, "", options...); err != nil {
+		if err := prompt.Select(ctx, &selected, msg, configurations[selected].Description, options...); err != nil {
 			return err
 		}
 		config = &postgresConfigurations(input.Manager)[selected]
@@ -325,13 +359,29 @@ func CreateCluster(ctx context.Context, org *api.Organization, region *api.Regio
 		}
 		input.InitialClusterSize = params.PostgresConfiguration.InitialClusterSize
 
-		// Resolve VM size
-		vmSize, err := resolveVMSize(ctx, params.VMSize)
-		if err != nil {
-			return err
+		if isCustomMachine {
+			guest, err := flag.GetMachineGuest(ctx, nil)
+			if err != nil {
+				return err
+			}
+
+			input.Guest = guest
+		} else {
+			// Resolve VM size
+			vmSize, err := resolveVMSize(ctx, params.VMSize)
+			if err != nil {
+				return err
+			}
+
+			input.VMSize = vmSize
 		}
 
-		input.VMSize = vmSize
+		if params.ScaleToZero != nil {
+			input.ScaleToZero = *params.ScaleToZero
+			if input.ScaleToZero && input.InitialClusterSize != 1 {
+				return errors.New("scale to zero is only supported for single node clusters")
+			}
+		}
 
 		// Resolve volume size
 		if params.DiskGb == 0 {
@@ -339,9 +389,9 @@ func CreateCluster(ctx context.Context, org *api.Organization, region *api.Regio
 				return err
 			}
 		}
-		input.VolumeSize = api.IntPointer(params.DiskGb)
+		input.VolumeSize = fly.IntPointer(params.DiskGb)
 		input.Autostart = params.Autostart
-	} else {
+	} else if input.BarmanRemoteRestoreConfig == "" {
 		// Resolve configuration from pre-defined configuration.
 		vmSize, err := resolveVMSize(ctx, config.VMSize)
 		if err != nil {
@@ -349,7 +399,7 @@ func CreateCluster(ctx context.Context, org *api.Organization, region *api.Regio
 		}
 
 		input.VMSize = vmSize
-		input.VolumeSize = api.IntPointer(config.DiskGb)
+		input.VolumeSize = fly.IntPointer(config.DiskGb)
 		input.InitialClusterSize = config.InitialClusterSize
 		input.ImageRef = params.ImageRef
 		input.Autostart = params.Autostart
@@ -370,7 +420,7 @@ func CreateCluster(ctx context.Context, org *api.Organization, region *api.Regio
 	return launcher.LaunchMachinesPostgres(ctx, input, params.Detach)
 }
 
-func resolveVMSize(ctx context.Context, targetSize string) (*api.VMSize, error) {
+func resolveVMSize(ctx context.Context, targetSize string) (*fly.VMSize, error) {
 	// verify the specified size
 	if targetSize != "" {
 		for _, size := range MachineVMSizes() {
@@ -379,7 +429,7 @@ func resolveVMSize(ctx context.Context, targetSize string) (*api.VMSize, error) 
 			}
 		}
 
-		return nil, fmt.Errorf("vm size %q is not valid", targetSize)
+		return nil, fmt.Errorf("VM size %q is not valid. For a full list of supported sizes use the command 'flyctl platform vm-sizes'", targetSize)
 	}
 	// prompt user to select machine specific size.
 	return prompt.SelectVMSize(ctx, MachineVMSizes())
@@ -397,12 +447,13 @@ type PostgresConfiguration struct {
 
 type ClusterParams struct {
 	PostgresConfiguration
-	Password   string
-	SnapshotID string
-	Detach     bool
-	Manager    string
-	ForkFrom   string
-	Autostart  bool
+	Password    string
+	SnapshotID  string
+	Detach      bool
+	Manager     string
+	ForkFrom    string
+	Autostart   bool
+	ScaleToZero *bool
 }
 
 func postgresConfigurations(manager string) []PostgresConfiguration {
@@ -479,15 +530,22 @@ func flexConfigurations() []PostgresConfiguration {
 }
 
 // machineVMSizes represents the available VM configurations for Machines.
-func MachineVMSizes() []api.VMSize {
+func MachineVMSizes() []fly.VMSize {
 	// TODO - Eventually we will have a flaps endpoint for this.
-	return []api.VMSize{
+	return []fly.VMSize{
 		{
 			Name:     "shared-cpu-1x",
 			CPUClass: "shared",
 			CPUCores: 1,
 			MemoryMB: 256,
 			MemoryGB: 0.25,
+		},
+		{
+			Name:     "shared-cpu-1x",
+			CPUClass: "shared",
+			CPUCores: 1,
+			MemoryMB: 1024,
+			MemoryGB: 1,
 		},
 		{
 			Name:     "shared-cpu-2x",
@@ -548,7 +606,7 @@ func MachineVMSizes() []api.VMSize {
 	}
 }
 
-func resolveForkFromVolume(ctx context.Context, machines []*api.Machine) (string, error) {
+func resolveForkFromVolume(ctx context.Context, machines []*fly.Machine) (string, error) {
 	if len(machines) == 0 {
 		return "", fmt.Errorf("No machines associated with fork-from target. See `fly pg create --help` for more information")
 	}
@@ -574,7 +632,7 @@ func resolveForkFromVolume(ctx context.Context, machines []*api.Machine) (string
 	return "", fmt.Errorf("Failed to resolve the volume associated with the primary instance. See `fly pg create --help` for more information")
 }
 
-func resolveForkFromManager(ctx context.Context, machines []*api.Machine) string {
+func resolveForkFromManager(ctx context.Context, machines []*fly.Machine) string {
 	if flag.GetBool(ctx, "stolon") {
 		return flypg.StolonManager
 	}
@@ -589,4 +647,15 @@ func resolveForkFromManager(ctx context.Context, machines []*api.Machine) string
 	}
 
 	return flypg.StolonManager
+}
+
+func resolveImageFromForkVolume(vol *fly.Volume, machines []*fly.Machine) string {
+	// Attempt to resolve the machine image that's associated with the volume
+	for _, m := range machines {
+		if m.Config.Mounts[0].Volume == vol.ID {
+			return m.FullImageRef()
+		}
+	}
+
+	return ""
 }

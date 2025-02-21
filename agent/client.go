@@ -16,17 +16,17 @@ import (
 	"time"
 
 	"github.com/azazeal/pause"
-	"github.com/blang/semver"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/superfly/flyctl/agent/internal/proto"
-	"github.com/superfly/flyctl/api"
-	"github.com/superfly/flyctl/client"
 	"github.com/superfly/flyctl/gql"
 	"github.com/superfly/flyctl/internal/buildinfo"
+	"github.com/superfly/flyctl/internal/config"
 	"github.com/superfly/flyctl/internal/flag"
+	"github.com/superfly/flyctl/internal/flyutil"
 	"github.com/superfly/flyctl/internal/logger"
 	"github.com/superfly/flyctl/internal/sentry"
+	"github.com/superfly/flyctl/internal/version"
 	"github.com/superfly/flyctl/internal/wireguard"
 	"github.com/superfly/flyctl/iostreams"
 	"github.com/superfly/flyctl/terminal"
@@ -34,7 +34,7 @@ import (
 )
 
 // Establish starts the daemon, if necessary, and returns a client to it.
-func Establish(ctx context.Context, apiClient *api.Client) (*Client, error) {
+func Establish(ctx context.Context, apiClient wireguard.WebClient) (*Client, error) {
 	if err := wireguard.PruneInvalidPeers(ctx, apiClient); err != nil {
 		return nil, err
 	}
@@ -46,7 +46,12 @@ func Establish(ctx context.Context, apiClient *api.Client) (*Client, error) {
 		return StartDaemon(ctx)
 	}
 
-	if buildinfo.Version().EQ(res.Version) {
+	resVer, err := version.Parse(res.Version)
+	if err != nil {
+		return nil, err
+	}
+
+	if buildinfo.Version().Equal(resVer) {
 		return c, nil
 	}
 
@@ -123,14 +128,53 @@ const (
 )
 
 type Client struct {
-	network string
-	address string
-	dialer  net.Dialer
+	network            string
+	address            string
+	dialer             net.Dialer
+	agentRefusedTokens bool
 }
 
 var errDone = errors.New("done")
 
-func (c *Client) do(parent context.Context, fn func(net.Conn) error) (err error) {
+func (c *Client) do(ctx context.Context, fn func(net.Conn) error) (err error) {
+	if c.agentRefusedTokens {
+		return c.doNoTokens(ctx, fn)
+	}
+
+	toks := config.Tokens(ctx)
+	if toks.Empty() {
+		return c.doNoTokens(ctx, fn)
+	}
+
+	var tokArgs []string
+	if file := toks.FromFile(); file != "" {
+		tokArgs = append(tokArgs, "cfg", file)
+	} else {
+		tokArgs = append(tokArgs, "str", toks.All())
+	}
+
+	return c.doNoTokens(ctx, func(conn net.Conn) error {
+		if err := proto.Write(conn, "set-token", tokArgs...); err != nil {
+			return err
+		}
+
+		data, err := proto.Read(conn)
+
+		switch {
+		case err == nil && string(data) == "ok":
+			return fn(conn)
+		case err != nil:
+			return err
+		case isError(data):
+			c.agentRefusedTokens = true
+			return c.do(ctx, fn)
+		default:
+			return err
+		}
+	})
+}
+
+func (c *Client) doNoTokens(parent context.Context, fn func(net.Conn) error) (err error) {
 	var conn net.Conn
 	if conn, err = c.dialContext(parent); err != nil {
 		return err
@@ -171,7 +215,7 @@ func (c *Client) Kill(ctx context.Context) error {
 
 type PingResponse struct {
 	PID        int
-	Version    semver.Version
+	Version    string
 	Background bool
 }
 
@@ -235,14 +279,14 @@ type EstablishResponse struct {
 	TunnelConfig   *wg.Config
 }
 
-func (c *Client) doEstablish(ctx context.Context, slug string, recycle bool) (res *EstablishResponse, err error) {
+func (c *Client) doEstablish(ctx context.Context, slug string, reestablish bool, network string) (res *EstablishResponse, err error) {
 	err = c.do(ctx, func(conn net.Conn) (err error) {
 		verb := "establish"
-		if recycle {
+		if reestablish {
 			verb = "reestablish"
 		}
 
-		if err = proto.Write(conn, verb, slug); err != nil {
+		if err = proto.Write(conn, verb, slug, network); err != nil {
 			return
 		}
 
@@ -270,17 +314,17 @@ func (c *Client) doEstablish(ctx context.Context, slug string, recycle bool) (re
 	return
 }
 
-func (c *Client) Establish(ctx context.Context, slug string) (res *EstablishResponse, err error) {
-	return c.doEstablish(ctx, slug, false)
+func (c *Client) Establish(ctx context.Context, slug, network string) (res *EstablishResponse, err error) {
+	return c.doEstablish(ctx, slug, false, network)
 }
 
-func (c *Client) Reestablish(ctx context.Context, slug string) (res *EstablishResponse, err error) {
-	return c.doEstablish(ctx, slug, true)
+func (c *Client) Reestablish(ctx context.Context, slug, network string) (res *EstablishResponse, err error) {
+	return c.doEstablish(ctx, slug, true, network)
 }
 
-func (c *Client) Probe(ctx context.Context, slug string) error {
+func (c *Client) Probe(ctx context.Context, slug, network string) error {
 	return c.do(ctx, func(conn net.Conn) (err error) {
-		if err = proto.Write(conn, "probe", slug); err != nil {
+		if err = proto.Write(conn, "probe", slug, network); err != nil {
 			return
 		}
 
@@ -302,9 +346,9 @@ func (c *Client) Probe(ctx context.Context, slug string) error {
 	})
 }
 
-func (c *Client) Resolve(ctx context.Context, slug, host string) (addr string, err error) {
+func (c *Client) Resolve(ctx context.Context, slug, host, network string) (addr string, err error) {
 	err = c.do(ctx, func(conn net.Conn) (err error) {
-		if err = proto.Write(conn, "resolve", slug, host); err != nil {
+		if err = proto.Write(conn, "resolve", slug, host, network); err != nil {
 			return
 		}
 
@@ -330,14 +374,40 @@ func (c *Client) Resolve(ctx context.Context, slug, host string) (addr string, e
 	return
 }
 
+func (c *Client) LookupTxt(ctx context.Context, slug, host string) (records []string, err error) {
+	err = c.do(ctx, func(conn net.Conn) (err error) {
+		if err = proto.Write(conn, "lookupTxt", slug, host); err != nil {
+			return
+		}
+
+		var data []byte
+		if data, err = proto.Read(conn); err != nil {
+			return
+		}
+
+		switch {
+		default:
+			err = errInvalidResponse(data)
+		case isOK(data):
+			err = unmarshal(&records, data)
+		case isError(data):
+			err = extractError(data)
+		}
+
+		return
+	})
+
+	return
+}
+
 // WaitForTunnel waits for a tunnel to the given org slug to become available
 // in the next four minutes.
-func (c *Client) WaitForTunnel(parent context.Context, slug string) (err error) {
+func (c *Client) WaitForTunnel(parent context.Context, slug, network string) (err error) {
 	ctx, cancel := context.WithTimeout(parent, 4*time.Minute)
 	defer cancel()
 
 	for {
-		if err = c.Probe(ctx, slug); !errors.Is(err, ErrTunnelUnavailable) {
+		if err = c.Probe(ctx, slug, network); !errors.Is(err, ErrTunnelUnavailable) {
 			break
 		}
 
@@ -352,7 +422,7 @@ func (c *Client) WaitForTunnel(parent context.Context, slug string) (err error) 
 }
 
 // WaitForDNS waits for a Fly host internal DNS entry to register
-func (c *Client) WaitForDNS(parent context.Context, dialer Dialer, slug string, host string) (err error) {
+func (c *Client) WaitForDNS(parent context.Context, dialer Dialer, slug, host, network string) (err error) {
 	io := iostreams.FromContext(parent)
 
 	if !flag.GetBool(parent, "quiet") {
@@ -365,7 +435,7 @@ func (c *Client) WaitForDNS(parent context.Context, dialer Dialer, slug string, 
 	}
 
 	for {
-		if _, err = c.Resolve(ctx, slug, host); !errors.Is(err, ErrNoSuchHost) {
+		if _, err = c.Resolve(ctx, slug, host, network); !errors.Is(err, ErrNoSuchHost) {
 			break
 		}
 
@@ -410,7 +480,7 @@ func (c *Client) Instances(ctx context.Context, org, app string) (instances Inst
 	go func() {
 		gqlChan <- gqlGetInstances(ctx, org, app)
 	}()
-	r, err := compareAndChooseResults(<-gqlChan, &agentInstances, <-agentChan, org, app)
+	r, err := compareAndChooseResults(ctx, <-gqlChan, &agentInstances, <-agentChan, org, app)
 	instances = *r
 	return
 }
@@ -420,16 +490,16 @@ type instancesResult struct {
 	Err       error
 }
 
-func compareAndChooseResults(gqlResult instancesResult, agentResult *Instances, agentErr error, orgSlug, appName string) (*Instances, error) {
+func compareAndChooseResults(ctx context.Context, gqlResult instancesResult, agentResult *Instances, agentErr error, orgSlug, appName string) (*Instances, error) {
 	terminal.Debugf("gqlErr: %v agentErr: %v\n", gqlResult.Err, agentErr)
 	if gqlResult.Err != nil && agentErr != nil {
-		captureError(fmt.Errorf("two errors looking up: %s %s: gqlErr: %v agentErr: %v", orgSlug, appName, gqlResult.Err.Error(), agentErr), "agentclient-instances", orgSlug, appName)
+		captureError(ctx, fmt.Errorf("two errors looking up: %s %s: gqlErr: %v agentErr: %v", orgSlug, appName, gqlResult.Err.Error(), agentErr), "agentclient-instances", orgSlug, appName)
 		return nil, gqlResult.Err
 	} else if gqlResult.Err != nil {
-		captureError(fmt.Errorf("gql error looking up: %s %s: %v", orgSlug, appName, gqlResult.Err), "agentclient-instances", orgSlug, appName)
+		captureError(ctx, fmt.Errorf("gql error looking up: %s %s: %v", orgSlug, appName, gqlResult.Err), "agentclient-instances", orgSlug, appName)
 		return agentResult, nil
 	} else if agentErr != nil {
-		captureError(fmt.Errorf("dns error looking up: %s %s: %v", orgSlug, appName, agentErr), "agentclient-instances", orgSlug, appName)
+		captureError(ctx, fmt.Errorf("dns error looking up: %s %s: %v", orgSlug, appName, agentErr), "agentclient-instances", orgSlug, appName)
 		return gqlResult.Instances, nil
 	} else if !arrayEqual(gqlResult.Instances.Addresses, agentResult.Addresses) {
 		return gqlResult.Instances, nil
@@ -438,12 +508,13 @@ func compareAndChooseResults(gqlResult instancesResult, agentResult *Instances, 
 	}
 }
 
-func captureError(err error, feature, orgSlug, appName string) {
+func captureError(ctx context.Context, err error, feature, orgSlug, appName string) {
 	if errors.Is(err, context.Canceled) {
 		return
 	}
 	terminal.Debugf("error: %v\n", err)
 	sentry.CaptureException(err,
+		sentry.WithTraceID(ctx),
 		sentry.WithTag("feature", feature),
 		sentry.WithContexts(map[string]sentry.Context{
 			"app": map[string]interface{}{
@@ -469,8 +540,7 @@ func arrayEqual(a, b []string) bool {
 }
 
 func gqlGetInstances(ctx context.Context, orgSlug, appName string) instancesResult {
-	flyClient := client.FromContext(ctx)
-	gqlClient := flyClient.API().GenqClient
+	gqlClient := flyutil.ClientFromContext(ctx).GenqClient()
 	_ = `# @genqlient
 	query AgentGetInstances($appName: String!) {
 		app(name: $appName) {
@@ -554,14 +624,15 @@ func unmarshal(dst interface{}, data []byte) (err error) {
 
 // Dialer establishes a connection to the wireguard agent and return a dialier
 // for use in subsequent actions, such as running ssh commands or opening proxies
-func (c *Client) Dialer(ctx context.Context, slug string) (d Dialer, err error) {
+func (c *Client) Dialer(ctx context.Context, slug, network string) (d Dialer, err error) {
 	var er *EstablishResponse
-	if er, err = c.Establish(ctx, slug); err == nil {
+	if er, err = c.Establish(ctx, slug, network); err == nil {
 		d = &dialer{
-			slug:   slug,
-			client: c,
-			state:  er.WireGuardState,
-			config: er.TunnelConfig,
+			slug:    slug,
+			network: network,
+			client:  c,
+			state:   er.WireGuardState,
+			config:  er.TunnelConfig,
 		}
 	}
 
@@ -570,18 +641,20 @@ func (c *Client) Dialer(ctx context.Context, slug string) (d Dialer, err error) 
 
 // ConnectToTunnel is a convenience method for connect to a wireguard tunnel
 // and returning a Dialer. Only suitable for use in the new CLI commands.
-func (c *Client) ConnectToTunnel(ctx context.Context, slug string) (d Dialer, err error) {
+func (c *Client) ConnectToTunnel(ctx context.Context, slug, network string, silent bool) (d Dialer, err error) {
 	io := iostreams.FromContext(ctx)
 
-	dialer, err := c.Dialer(ctx, slug)
+	dialer, err := c.Dialer(ctx, slug, network)
 	if err != nil {
 		return nil, err
 	}
-	io.StartProgressIndicatorMsg(fmt.Sprintf("Opening a wireguard tunnel to %s", slug))
-	if err := c.WaitForTunnel(ctx, slug); err != nil {
+	if !silent {
+		io.StartProgressIndicatorMsg(fmt.Sprintf("Opening a wireguard tunnel to %s", slug))
+		defer io.StopProgressIndicator()
+	}
+	if err := c.WaitForTunnel(ctx, slug, network); err != nil {
 		return nil, fmt.Errorf("tunnel unavailable for organization %s: %w", slug, err)
 	}
-	io.StopProgressIndicator()
 	return dialer, err
 }
 
@@ -594,6 +667,7 @@ type Dialer interface {
 
 type dialer struct {
 	slug    string
+	network string
 	timeout time.Duration
 
 	state  *wg.WireGuardState
@@ -623,7 +697,7 @@ func (d *dialer) DialContext(ctx context.Context, network, addr string) (conn ne
 	c := make(chan error, 1)
 	go func() {
 		timeout := strconv.FormatInt(int64(d.timeout), 10)
-		if err := proto.Write(conn, "connect", d.slug, addr, timeout); err != nil {
+		if err := proto.Write(conn, "connect", d.slug, addr, timeout, d.network); err != nil {
 			c <- err
 			return
 		}
@@ -667,8 +741,8 @@ type Pinger struct {
 // opening an additional connection to the agent, which is upgraded
 // to a Pinger connection by sending the "ping6" command. Call "Close"
 // on a Pinger when you're done pinging things.
-func (c *Client) Pinger(ctx context.Context, slug string) (p *Pinger, err error) {
-	if _, err = c.Establish(ctx, slug); err != nil {
+func (c *Client) Pinger(ctx context.Context, slug, network string) (p *Pinger, err error) {
+	if _, err = c.Establish(ctx, slug, network); err != nil {
 		return nil, fmt.Errorf("pinger: %w", err)
 	}
 

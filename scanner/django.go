@@ -1,15 +1,19 @@
 package scanner
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
+	"os/exec"
+	"path"
+	"path/filepath"
+	"regexp"
+	"strings"
+
 	"github.com/blang/semver"
 	"github.com/logrusorgru/aurora"
 	"github.com/mattn/go-zglob"
 	"github.com/superfly/flyctl/helpers"
-	"os/exec"
-	"path"
-	"regexp"
-	"strings"
 )
 
 // setup django with a postgres database
@@ -39,41 +43,48 @@ func configureDjango(sourceDir string, config *ScannerConfig) (*SourceInfo, erro
 				UrlPrefix: "/static/",
 			},
 		},
-		SkipDeploy:     true,
+		SkipDeploy:     false,
 		ConsoleCommand: "/code/manage.py shell",
 	}
 
 	vars := make(map[string]interface{})
 
 	// keep `pythonLatestSupported` up to date: https://devguide.python.org/versions/#supported-versions
-	// Keep the default `pythonVersion` as "3.10" (previously hardcoded on the Dockerfile)
-	pythonLatestSupported := "3.7.0"
-	pythonVersion := "3.10"
+	// Keep the default `pythonVersion` as "3.12"
+	pythonLatestSupported := "3.9.0"
+	pythonVersion := "3.12"
 
-	pythonFullVersion, err := extractPythonVersion()
+	pythonFullVersion, pinned, err := extractPythonVersion()
 
 	if err == nil && pythonFullVersion != "" {
-		userVersion, userErr := semver.ParseTolerant(pythonFullVersion)
-		supportedVersion, supportedErr := semver.ParseTolerant(pythonLatestSupported)
+		if pinned {
+			// We pin versions if they're beta or RC and, as such, don't have a
+			// minor version equivalent Docker tag.
+			pythonVersion = pythonFullVersion
+			s.Notice += fmt.Sprintf(`%s It looks like you have Python %s installed, which is not an official release. This version is being explicitly pinned in the generated Dockerfile, and should be changed to an official release before deploying to production.`, aurora.Yellow("[WARNING]"), pythonFullVersion)
+		} else {
+			userVersion, userErr := semver.ParseTolerant(pythonFullVersion)
+			supportedVersion, supportedErr := semver.ParseTolerant(pythonLatestSupported)
 
-		if userErr == nil && supportedErr == nil {
-			// if Python version is below 3.7.0, use Python 3.10 (default)
-			// it is required to have Major, Minor and Patch (e.g. 3.11.2) to be able to use GT
-			// but only Major and Minor (e.g. 3.11) is used in the Dockerfile
-			if userVersion.GTE(supportedVersion) {
-				v, err := semver.Parse(pythonFullVersion)
-				if err == nil {
-					pythonVersion = fmt.Sprintf("%d.%d", v.Major, v.Minor)
-				}
-				s.Notice += fmt.Sprintf(`
-%s Python %s was detected. 'python:%s-slim-buster' image will be set in the Dockerfile.
+			if userErr == nil && supportedErr == nil {
+				// if Python version is below 3.9.0, use Python 3.12 (default)
+				// it is required to have Major, Minor and Patch (e.g. 3.12.0) to be able to use GT
+				// but only Major and Minor (e.g. 3.12) is used in the Dockerfile
+				if userVersion.GTE(supportedVersion) {
+					v, err := semver.Parse(pythonFullVersion)
+					if err == nil {
+						pythonVersion = fmt.Sprintf("%d.%d", v.Major, v.Minor)
+					}
+					s.Notice += fmt.Sprintf(`
+%s Python %s was detected. 'python:%s-slim' image will be set in the Dockerfile.
 `, aurora.Faint("[INFO]"), pythonFullVersion, pythonVersion)
-			} else {
-				s.Notice += fmt.Sprintf(`
+				} else {
+					s.Notice += fmt.Sprintf(`
 %s It looks like you have Python %s installed, but it has reached its end of support. Using Python %s to build your image instead.
 Make sure to update the Dockerfile to use an image that is compatible with the Python version you are using.
 %s We highly recommend that you update your application to use Python %s or newer. (https://devguide.python.org/versions/#supported-versions)
 `, aurora.Yellow("[WARNING]"), pythonFullVersion, pythonVersion, aurora.Yellow("[WARNING]"), pythonLatestSupported)
+				}
 			}
 		}
 	} else {
@@ -85,13 +96,12 @@ Make sure to update the Dockerfile to use an image that is compatible with the P
 	}
 
 	vars["pythonVersion"] = pythonVersion
+	vars["pinnedPythonVersion"] = pinned
 
 	if checksPass(sourceDir, fileExists("Pipfile")) {
 		vars["pipenv"] = true
 	} else if checksPass(sourceDir, fileExists("pyproject.toml")) {
 		vars["poetry"] = true
-	} else if checksPass(sourceDir, fileExists("requirements.txt")) {
-		vars["venv"] = true
 	}
 
 	wsgiFiles, err := zglob.Glob(`./**/wsgi.py`)
@@ -101,7 +111,7 @@ Make sure to update the Dockerfile to use an image that is compatible with the P
 		for _, wsgiPath := range wsgiFiles {
 			// when using a virtual environment to manage the dependencies (e.g. venv), the 'site-packages/' folder is created within the virtual environment folder
 			// This folder contains all the (dependencies) packages installed within the virtual environment
-			// exclude dependencies matches that contain 'site-packages' in the path (e.g. .venv/lib/python3.11/site-packages/django/core/handlers/wsgi.py)
+			// exclude dependencies matches that contain 'site-packages' in the path (e.g. .venv/lib/python3.12/site-packages/django/core/handlers/wsgi.py)
 			if !strings.Contains(wsgiPath, "site-packages") {
 				wsgiFilesProject = append(wsgiFilesProject, wsgiPath)
 			}
@@ -115,6 +125,7 @@ Make sure to update the Dockerfile to use an image that is compatible with the P
 			vars["wsgiFound"] = true
 			if wsgiFilesLen > 1 {
 				// warning: multiple wsgi.py files found
+				s.SkipDeploy = true
 				s.DeployDocs = s.DeployDocs + fmt.Sprintf(`
 Multiple wsgi.py files were found in your Django application:
 [%s]
@@ -125,12 +136,89 @@ This module is used on Dockerfile to start the Gunicorn server process.
 		}
 	}
 
-	// check if settings.py file exists
-	settingsFiles, err := zglob.Glob(`./**/settings.py`)
+	if checksPass(sourceDir, dirContains("requirements.txt", "gunicorn")) ||
+		checksPass(sourceDir, dirContains("Pipfile", "gunicorn")) ||
+		checksPass(sourceDir, dirContains("pyproject.toml", "gunicorn")) {
+		vars["hasGunicorn"] = true
+	}
 
-	if err == nil && len(settingsFiles) == 0 {
+	if checksPass(sourceDir, dirContains("requirements.txt", "daphne")) ||
+		checksPass(sourceDir, dirContains("Pipfile", "daphne")) ||
+		checksPass(sourceDir, dirContains("pyproject.toml", "daphne")) {
+		vars["hasDaphne"] = true
+	}
+
+	if checksPass(sourceDir, dirContains("requirements.txt", "uvicorn")) ||
+		checksPass(sourceDir, dirContains("Pipfile", "uvicorn")) ||
+		checksPass(sourceDir, dirContains("pyproject.toml", "uvicorn")) {
+		vars["hasUvicorn"] = true
+	}
+
+	if checksPass(sourceDir, dirContains("requirements.txt", "redis")) ||
+		checksPass(sourceDir, dirContains("Pipfile", "redis")) ||
+		checksPass(sourceDir, dirContains("pyproject.toml", "redis")) {
+		s.RedisDesired = true
+	}
+
+	if checksPass(sourceDir, dirContains("requirements.txt", "boto")) ||
+		checksPass(sourceDir, dirContains("Pipfile", "boto")) ||
+		checksPass(sourceDir, dirContains("pyproject.toml", "boto")) {
+		s.ObjectStorageDesired = true
+	}
+
+	asgiFiles, err := zglob.Glob(`./**/asgi.py`)
+
+	if err == nil && len(asgiFiles) > 0 {
+		var asgiFilesProject []string
+		for _, asgiPath := range asgiFiles {
+			// When using a virtual environment to manage the dependencies (e.g. venv),
+			// the 'site-packages/' folder is created within the virtual environment
+			// folder. This folder contains all the (dependencies) packages installed
+			// within the virtual environment.
+			// Exclude dependencies matches that contain 'site-packages'.
+			if !strings.Contains(asgiPath, "site-packages") {
+				asgiFilesProject = append(asgiFilesProject, asgiPath)
+			}
+		}
+
+		if len(asgiFilesProject) > 0 {
+			asgiFilesLen := len(asgiFilesProject)
+			dirPath, _ := path.Split(asgiFilesProject[asgiFilesLen-1])
+			dirName := path.Base(dirPath)
+			vars["asgiName"] = dirName
+			vars["asgiFound"] = true
+			if asgiFilesLen > 1 {
+				// Warning: multiple asgi.py files found.
+				s.SkipDeploy = true
+				s.DeployDocs = s.DeployDocs + fmt.Sprintf(`
+Multiple asgi.py files were found in your Django application:
+[%s]
+Before proceeding, make sure '%s' is the module containing a ASGI application object named 'application'. If not, update your Dockefile.
+This module is used on Dockerfile to start the Daphne server process.
+`, strings.Join(asgiFilesProject, ", "), dirPath)
+			}
+		}
+	}
+
+	// check if settings.py file exists
+	allSettingsFiles, err := zglob.Glob(`./**/settings.py`)
+
+	if err == nil && len(allSettingsFiles) == 0 {
 		// if no settings.py files are found, check if any *prod*.py (e.g. production.py, prod.py, settings_prod.py) exists in 'settings/' folder
-		settingsFiles, err = zglob.Glob(`./**/settings/*prod*.py`)
+		allSettingsFiles, err = zglob.Glob(`./**/settings/*prod*.py`)
+	}
+	var settingsFiles []string
+	if err == nil && len(allSettingsFiles) > 0 {
+		for _, settingsFile := range allSettingsFiles {
+			// When using a virtual environment to manage the dependencies (e.g. venv),
+			// the 'site-packages/' folder is created within the virtual environment
+			// folder. This folder contains all the (dependencies) packages installed
+			// within the virtual environment.
+			// Exclude dependencies matches that contain 'site-packages'.
+			if !strings.Contains(settingsFile, "site-packages") {
+				settingsFiles = append(settingsFiles, settingsFile)
+			}
+		}
 	}
 
 	if err == nil && len(settingsFiles) > 0 {
@@ -138,6 +226,7 @@ This module is used on Dockerfile to start the Gunicorn server process.
 		// check if multiple settings.py files were found; warn the user it's not recommended and what to do instead
 		if settingsFilesLen > 1 {
 			// warning: multiple settings.py files found
+			s.SkipDeploy = true
 			s.DeployDocs = s.DeployDocs + fmt.Sprintf(`
 Multiple 'settings.py' files were found in your Django application:
 [%s]
@@ -177,15 +266,16 @@ Optionally, you can use django.core.management.utils.get_random_secret_key() to 
 		}
 	}
 
-	s.Files = templatesExecute("templates/django", vars)
-
 	// check if project has a postgres dependency
 	if checksPass(sourceDir, dirContains("requirements.txt", "psycopg")) ||
 		checksPass(sourceDir, dirContains("Pipfile", "psycopg")) ||
 		checksPass(sourceDir, dirContains("pyproject.toml", "psycopg")) {
-		s.ReleaseCmd = "python manage.py migrate"
+		vars["hasPostgres"] = true
+		s.ReleaseCmd = "python manage.py migrate --noinput"
+		s.DatabaseDesired = DatabaseKindPostgres
 
 		if !checksPass(sourceDir, dirContains("requirements.txt", "django-environ", "dj-database-url")) {
+			s.SkipDeploy = true
 			s.DeployDocs = s.DeployDocs + `
 Your Django app is almost ready to deploy!
 
@@ -195,21 +285,71 @@ For detailed documentation, see https://fly.dev/docs/django/
 		`
 		} else {
 			s.DeployDocs = s.DeployDocs + `
-Your Django app is ready to deploy!
-
 For detailed documentation, see https://fly.dev/docs/django/
 		`
 		}
 	}
 
+	// compute command to run the server
+	var cmd []string
+
+	if vars["asgiFound"] == true && vars["hasUvicorn"] == true {
+		cmd = []string{"gunicorn", "--bind", ":8000", "--workers", "2", "--worker-class", "uvicorn.workers.UvicornWorker", vars["asgiName"].(string) + ".asgi"}
+	} else if vars["asgiFound"] == true && vars["hasDaphne"] == true {
+		cmd = []string{"daphne", "-b", "0.0.0.0", "-p", "8000", vars["asgiName"].(string) + ".asgi"}
+	} else if vars["wsgiFound"] == true {
+		cmd = []string{"gunicorn", "--bind", ":8000", "--workers", "2", vars["wsgiName"].(string) + ".wsgi"}
+	} else {
+		cmd = []string{"python", "manage.py", "runserver"}
+	}
+
+	// Serialize the array to JSON
+	jsonData, err := json.Marshal(cmd)
+	if err != nil {
+		return nil, err
+	}
+
+	vars["cmd"] = string(jsonData)
+
+	// check if project has a celery dependency
+	if len(settingsFiles) == 1 {
+		if checksPass(sourceDir, dirContains("requirements.txt", "celery")) ||
+			checksPass(sourceDir, dirContains("Pipfile", "celery")) ||
+			checksPass(sourceDir, dirContains("pyproject.toml", "celery")) {
+
+			segments := strings.Split(settingsFiles[0], string(os.PathSeparator))
+			s.Processes = map[string]string{
+				"app":    strings.Join(cmd, " "),
+				"celery": "celery -A " + segments[0] + " worker --loglevel=INFO",
+			}
+		}
+	}
+
+	// Perform a glob search for */bin/activate
+	path := filepath.Join("*", "bin", "activate")
+	matches, err := filepath.Glob(path)
+	if err != nil {
+		return nil, err
+	}
+
+	// If we find a virtual environment, set the venv flag and the venvdir variable
+	if len(matches) == 1 {
+		vars["venv"] = true
+		segments := strings.Split(matches[0], string(os.PathSeparator))
+		vars["venvdir"] = segments[0]
+	}
+
+	s.Files = templatesExecute("templates/django", vars)
+
 	return s, nil
 }
 
-func extractPythonVersion() (string, error) {
+func extractPythonVersion() (string, bool, error) {
 	/* Example Output:
 	   Python 3.11.2
+	   Python 3.12.0b4
 	*/
-	pythonVersionOutput := "Python 3.10.0" // Fallback to 3.10
+	pythonVersionOutput := "Python 3.12.0" // Fallback to 3.12
 
 	cmd := exec.Command("python3", "--version")
 	out, err := cmd.CombinedOutput()
@@ -223,11 +363,14 @@ func extractPythonVersion() (string, error) {
 		}
 	}
 
-	re := regexp.MustCompile(`Python ([0-9]+\.[0-9]+\.[0-9]+)`)
+	re := regexp.MustCompile(`Python ([0-9]+\.[0-9]+\.[0-9]+(?:[a-zA-Z]+[0-9]+)?)`)
 	match := re.FindStringSubmatch(pythonVersionOutput)
 
 	if len(match) > 1 {
-		return match[1], nil // "3.11.2", nil
+		version := match[1]
+		nonNumericRegex := regexp.MustCompile(`[^0-9.]`)
+		pinned := nonNumericRegex.MatchString(version)
+		return version, pinned, nil
 	}
-	return "", fmt.Errorf("Could not find Python version")
+	return "", false, fmt.Errorf("Could not find Python version")
 }

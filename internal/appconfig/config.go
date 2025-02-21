@@ -3,29 +3,32 @@
 package appconfig
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net/url"
+	"os"
 	"reflect"
+	"slices"
 
-	"github.com/superfly/flyctl/api"
-	"github.com/superfly/flyctl/scanner"
-	"golang.org/x/exp/slices"
+	fly "github.com/superfly/fly-go"
 )
 
 const (
 	// DefaultConfigFileName denotes the default application configuration file name.
 	DefaultConfigFileName = "fly.toml"
-	// Config is versioned, initially, to separate nomad from machine apps without having to consult
-	// the API
-	MachinesPlatform = "machines"
-	NomadPlatform    = "nomad"
-	DetachedPlatform = "detached"
+)
+
+type RestartPolicy string
+
+const (
+	RestartPolicyAlways    RestartPolicy = "always"
+	RestartPolicyNever     RestartPolicy = "never"
+	RestartPolicyOnFailure RestartPolicy = "on-failure"
 )
 
 func NewConfig() *Config {
 	return &Config{
-		RawDefinition:    map[string]any{},
-		defaultGroupName: api.MachineProcessGroupApp,
+		defaultGroupName: fly.MachineProcessGroupApp,
 		configFilePath:   "--config path unset--",
 	}
 }
@@ -36,55 +39,109 @@ type Config struct {
 	AppName        string        `toml:"app,omitempty" json:"app,omitempty"`
 	PrimaryRegion  string        `toml:"primary_region,omitempty" json:"primary_region,omitempty"`
 	KillSignal     *string       `toml:"kill_signal,omitempty" json:"kill_signal,omitempty"`
-	KillTimeout    *api.Duration `toml:"kill_timeout,omitempty" json:"kill_timeout,omitempty"`
+	KillTimeout    *fly.Duration `toml:"kill_timeout,omitempty" json:"kill_timeout,omitempty"`
+	SwapSizeMB     *int          `toml:"swap_size_mb,omitempty" json:"swap_size_mb,omitempty"`
 	ConsoleCommand string        `toml:"console_command,omitempty" json:"console_command,omitempty"`
 
 	// Sections that are typically short and benefit from being on top
 	Experimental *Experimental     `toml:"experimental,omitempty" json:"experimental,omitempty"`
 	Build        *Build            `toml:"build,omitempty" json:"build,omitempty"`
-	Deploy       *Deploy           `toml:"deploy, omitempty" json:"deploy,omitempty"`
+	Deploy       *Deploy           `toml:"deploy,omitempty" json:"deploy,omitempty"`
 	Env          map[string]string `toml:"env,omitempty" json:"env,omitempty"`
 
 	// Fields that are process group aware must come after Processes
-	Processes   map[string]string         `toml:"processes,omitempty" json:"processes,omitempty"`
-	Mounts      []Mount                   `toml:"mounts,omitempty" json:"mounts,omitempty"`
-	HTTPService *HTTPService              `toml:"http_service,omitempty" json:"http_service,omitempty"`
-	Services    []Service                 `toml:"services,omitempty" json:"services,omitempty"`
-	Checks      map[string]*ToplevelCheck `toml:"checks,omitempty" json:"checks,omitempty"`
+	Processes        map[string]string         `toml:"processes,omitempty" json:"processes,omitempty"`
+	Mounts           []Mount                   `toml:"mounts,omitempty" json:"mounts,omitempty"`
+	HTTPService      *HTTPService              `toml:"http_service,omitempty" json:"http_service,omitempty"`
+	Services         []Service                 `toml:"services,omitempty" json:"services,omitempty"`
+	Checks           map[string]*ToplevelCheck `toml:"checks,omitempty" json:"checks,omitempty"`
+	Files            []File                    `toml:"files,omitempty" json:"files,omitempty"`
+	HostDedicationID string                    `toml:"host_dedication_id,omitempty" json:"host_dedication_id,omitempty"`
+
+	MachineChecks []*ServiceMachineCheck `toml:"machine_checks,omitempty" json:"machine_checks,omitempty"`
+
+	Restart []Restart `toml:"restart,omitempty" json:"restart,omitempty"`
+
+	Compute []*Compute `toml:"vm,omitempty" json:"vm,omitempty"`
 
 	// Others, less important.
-	Statics []Static            `toml:"statics,omitempty" json:"statics,omitempty"`
-	Metrics *api.MachineMetrics `toml:"metrics,omitempty" json:"metrics,omitempty"`
+	Statics []Static   `toml:"statics,omitempty" json:"statics,omitempty"`
+	Metrics []*Metrics `toml:"metrics,omitempty" json:"metrics,omitempty"`
 
-	// RawDefinition contains fly.toml parsed as-is
-	// If you add any config field that is v2 specific, be sure to remove it in SanitizeDefinition()
-	RawDefinition map[string]any `toml:"-" json:"-"`
+	// MergedFiles is a list of files that have been merged from the app config and flags.
+	MergedFiles []*fly.File `toml:"-" json:"-"`
 
 	// Path to application configuration file, usually fly.toml.
 	configFilePath string
 
-	// Indicates the intended platform to use: machines or nomad
-	platformVersion string
-
 	// Set when it fails to unmarshal fly.toml into Config
-	// Don't hard fail because RawDefinition still holds the app configuration for Nomad apps
 	v2UnmarshalError error
 
 	// The default group name to refer to (used with flatten configs)
 	defaultGroupName string
 }
 
+type Metrics struct {
+	*fly.MachineMetrics
+	Processes []string `json:"processes,omitempty" toml:"processes,omitempty"`
+}
+
 type Deploy struct {
-	ReleaseCommand string `toml:"release_command,omitempty" json:"release_command,omitempty"`
-	Strategy       string `toml:"strategy,omitempty" json:"strategy,omitempty"`
+	Strategy              string        `toml:"strategy,omitempty" json:"strategy,omitempty"`
+	MaxUnavailable        *float64      `toml:"max_unavailable,omitempty" json:"max_unavailable,omitempty"`
+	WaitTimeout           *fly.Duration `toml:"wait_timeout,omitempty" json:"wait_timeout,omitempty"`
+	ReleaseCommand        string        `toml:"release_command,omitempty" json:"release_command,omitempty"`
+	ReleaseCommandTimeout *fly.Duration `toml:"release_command_timeout,omitempty" json:"release_command_timeout,omitempty"`
+	ReleaseCommandCompute *Compute      `toml:"release_command_vm,omitempty" json:"release_command_vm,omitempty"`
+	SeedCommand           string        `toml:"seed_command,omitempty" json:"seed_command,omitempty"`
+}
+
+type File struct {
+	GuestPath  string   `toml:"guest_path,omitempty" json:"guest_path,omitempty" validate:"required"`
+	LocalPath  string   `toml:"local_path,omitempty" json:"local_path,omitempty"`
+	SecretName string   `toml:"secret_name,omitempty" json:"secret_name,omitempty"`
+	RawValue   string   `toml:"raw_value,omitempty" json:"raw_value,omitempty"`
+	Processes  []string `json:"processes,omitempty" toml:"processes,omitempty"`
+}
+
+func (f File) toMachineFile() (*fly.File, error) {
+	file := &fly.File{
+		GuestPath: f.GuestPath,
+	}
+	switch {
+	case f.LocalPath != "":
+		content, err := os.ReadFile(f.LocalPath)
+		if err != nil {
+			return nil, fmt.Errorf("could not read file %s: %w", f.LocalPath, err)
+		}
+		rawValue := base64.StdEncoding.EncodeToString(content)
+		file.RawValue = &rawValue
+	case f.SecretName != "":
+		file.SecretName = &f.SecretName
+	case f.RawValue != "":
+		encodedValue := base64.StdEncoding.EncodeToString([]byte(f.RawValue))
+		file.RawValue = &encodedValue
+	}
+	return file, nil
 }
 
 type Static struct {
-	GuestPath string `toml:"guest_path" json:"guest_path,omitempty" validate:"required"`
-	UrlPrefix string `toml:"url_prefix" json:"url_prefix,omitempty" validate:"required"`
+	GuestPath     string `toml:"guest_path" json:"guest_path,omitempty" validate:"required"`
+	UrlPrefix     string `toml:"url_prefix" json:"url_prefix,omitempty" validate:"required"`
+	TigrisBucket  string `toml:"tigris_bucket,omitempty" json:"tigris_bucket"`
+	IndexDocument string `toml:"index_document,omitempty" json:"index_document,omitempty"`
 }
 
-type Mount = scanner.Volume
+type Mount struct {
+	Source                  string   `toml:"source,omitempty" json:"source,omitempty"`
+	Destination             string   `toml:"destination,omitempty" json:"destination,omitempty"`
+	InitialSize             string   `toml:"initial_size,omitempty" json:"initial_size,omitempty"`
+	SnapshotRetention       *int     `toml:"snapshot_retention,omitempty" json:"snapshot_retention,omitempty"`
+	AutoExtendSizeThreshold int      `toml:"auto_extend_size_threshold,omitempty" json:"auto_extend_size_threshold,omitempty"`
+	AutoExtendSizeIncrement string   `toml:"auto_extend_size_increment,omitempty" json:"auto_extend_size_increment,omitempty"`
+	AutoExtendSizeLimit     string   `toml:"auto_extend_size_limit,omitempty" json:"auto_extend_size_limit,omitempty"`
+	Processes               []string `toml:"processes,omitempty" json:"processes,omitempty"`
+}
 
 type Build struct {
 	Builder           string            `toml:"builder,omitempty" json:"builder,omitempty"`
@@ -99,12 +156,36 @@ type Build struct {
 }
 
 type Experimental struct {
-	Cmd          []string `toml:"cmd,omitempty" json:"cmd,omitempty"`
-	Entrypoint   []string `toml:"entrypoint,omitempty" json:"entrypoint,omitempty"`
-	Exec         []string `toml:"exec,omitempty" json:"exec,omitempty"`
-	AutoRollback bool     `toml:"auto_rollback,omitempty" json:"auto_rollback,omitempty"`
-	EnableConsul bool     `toml:"enable_consul,omitempty" json:"enable_consul,omitempty"`
-	EnableEtcd   bool     `toml:"enable_etcd,omitempty" json:"enable_etcd,omitempty"`
+	Cmd            []string `toml:"cmd,omitempty" json:"cmd,omitempty"`
+	Entrypoint     []string `toml:"entrypoint,omitempty" json:"entrypoint,omitempty"`
+	Exec           []string `toml:"exec,omitempty" json:"exec,omitempty"`
+	AutoRollback   bool     `toml:"auto_rollback,omitempty" json:"auto_rollback,omitempty"`
+	EnableConsul   bool     `toml:"enable_consul,omitempty" json:"enable_consul,omitempty"`
+	EnableEtcd     bool     `toml:"enable_etcd,omitempty" json:"enable_etcd,omitempty"`
+	LazyLoadImages bool     `toml:"lazy_load_images,omitempty" json:"lazy_load_images,omitempty"`
+	Attached       Attached `toml:"attached,omitempty" json:"attached,omitempty"`
+	MachineConfig  string   `toml:"machine_config,omitempty" json:"machine_config,omitempty"`
+	UseZstd        bool     `toml:"use_zstd,omitempty" json:"use_zstd,omitempty"`
+}
+
+type Attached struct {
+	Secrets AttachedSecrets `toml:"secrets,omitempty" json:"secrets,omitempty"`
+}
+
+type AttachedSecrets struct {
+	Export map[string]string `toml:"export,omitempty" json:"export,omitempty"`
+}
+
+type Compute struct {
+	Size              string `json:"size,omitempty" toml:"size,omitempty"`
+	Memory            string `json:"memory,omitempty" toml:"memory,omitempty"`
+	*fly.MachineGuest `toml:",inline" json:",inline"`
+	Processes         []string `json:"processes,omitempty" toml:"processes,omitempty"`
+}
+type Restart struct {
+	Policy     RestartPolicy `toml:"policy,omitempty" json:"policy,omitempty"`
+	MaxRetries int           `toml:"retries,omitempty" json:"retries,omitempty"`
+	Processes  []string      `json:"processes,omitempty" toml:"processes,omitempty"`
 }
 
 func (c *Config) ConfigFilePath() string {
@@ -115,21 +196,39 @@ func (c *Config) SetConfigFilePath(configFilePath string) {
 	c.configFilePath = configFilePath
 }
 
-func (c *Config) HasNonHttpAndHttpsStandardServices() bool {
+func (c *Config) DetermineIPType(ipType string) string {
+	// If the app is a flycast app, then it requires a private IP
+	if ipType == "private" {
+		return "private"
+	}
+
+	// If there is a service that is not http or https on standard points, then it requires a dedicated IP
 	for _, service := range c.Services {
 		switch service.Protocol {
 		case "udp":
-			return true
+			return "dedicated"
 		case "tcp":
 			for _, p := range service.Ports {
 				if p.HasNonHttpPorts() {
-					return true
+					return "dedicated"
 				} else if p.ContainsPort(80) && !reflect.DeepEqual(p.Handlers, []string{"http"}) {
-					return true
+					return "dedicated"
 				} else if p.ContainsPort(443) && !(reflect.DeepEqual(p.Handlers, []string{"http", "tls"}) || reflect.DeepEqual(p.Handlers, []string{"tls", "http"})) {
-					return true
+					return "dedicated"
 				}
 			}
+		}
+	}
+
+	// Use shared IP if there are no services that require a dedicated IP
+	return "shared"
+}
+
+// IsUsingGPU returns true if any VMs have a gpu-kind set.
+func (c *Config) IsUsingGPU() bool {
+	for _, vm := range c.Compute {
+		if vm != nil && vm.MachineGuest != nil && vm.MachineGuest.GPUKind != "" {
+			return true
 		}
 	}
 	return false
@@ -250,6 +349,34 @@ func (cfg *Config) URL() *url.URL {
 	}
 }
 
-func (cfg *Config) PlatformVersion() string {
-	return cfg.platformVersion
+// MergeFiles merges the provided files with the files in the config wherein the provided files
+// take precedence.
+func (cfg *Config) MergeFiles(files []*fly.File) error {
+	// First convert the Config files to Machine files.
+	cfgFiles := make([]*fly.File, 0, len(cfg.Files))
+	for _, f := range cfg.Files {
+		machineFile, err := f.toMachineFile()
+		if err != nil {
+			return err
+		}
+		cfgFiles = append(cfgFiles, machineFile)
+	}
+
+	// Merge the config files with the provided files.
+	mConfig := &fly.MachineConfig{
+		Files: cfgFiles,
+	}
+	fly.MergeFiles(mConfig, files)
+
+	// Persist the merged files back to the config to be used later for deploying.
+	cfg.MergedFiles = mConfig.Files
+
+	return nil
+}
+
+func (cfg *Config) DeployStrategy() string {
+	if cfg.Deploy == nil {
+		return ""
+	}
+	return cfg.Deploy.Strategy
 }

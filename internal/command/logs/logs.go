@@ -11,15 +11,14 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/superfly/flyctl/api"
 	"github.com/superfly/flyctl/iostreams"
 	"github.com/superfly/flyctl/logs"
 
-	"github.com/superfly/flyctl/client"
 	"github.com/superfly/flyctl/internal/appconfig"
 	"github.com/superfly/flyctl/internal/command"
 	"github.com/superfly/flyctl/internal/config"
 	"github.com/superfly/flyctl/internal/flag"
+	"github.com/superfly/flyctl/internal/flyutil"
 	"github.com/superfly/flyctl/internal/logger"
 	"github.com/superfly/flyctl/internal/render"
 )
@@ -31,6 +30,9 @@ the Fly platform.
 
 Logs can be filtered to a specific instance using the --instance/-i flag or
 to all instances running in a specific region using the --region/-r flag.
+
+By default logs are continually streamed until the command is aborted.
+Use --no-tail to only fetch the logs in the buffer.
 `
 		short = "View app logs"
 	)
@@ -48,39 +50,54 @@ to all instances running in a specific region using the --region/-r flag.
 		flag.Region(),
 		flag.JSONOutput(),
 		flag.String{
-			Name:        "instance",
-			Shorthand:   "i",
-			Description: "Filter by instance ID",
+			Name:              "machine",
+			Description:       "Filter by machine ID",
+			Aliases:           []string{"instance"},
+			UseAliasShortHand: true,
+		},
+		flag.Bool{
+			Name:        "no-tail",
+			Shorthand:   "n",
+			Description: "Do not continually stream logs",
 		},
 	)
-	cmd.AddCommand(newShip(), newUnship(), newDashboard())
 	return
 }
 
 func run(ctx context.Context) error {
-	client := client.FromContext(ctx).API()
+	client := flyutil.ClientFromContext(ctx)
 
 	opts := &logs.LogOptions{
 		AppName:    appconfig.NameFromContext(ctx),
 		RegionCode: config.FromContext(ctx).Region,
-		VMID:       flag.GetString(ctx, "instance"),
+		VMID:       flag.GetString(ctx, "machine"),
+		NoTail:     flag.GetBool(ctx, "no-tail"),
 	}
 
 	var eg *errgroup.Group
 	eg, ctx = errgroup.WithContext(ctx)
 
-	pollingCtx, cancelPolling := context.WithCancel(ctx)
-	pollEntries := poll(pollingCtx, eg, client, opts)
-	liveEntries := nats(ctx, eg, client, opts, cancelPolling)
+	var streams []<-chan logs.LogEntry
+	if opts.NoTail {
+		streams = []<-chan logs.LogEntry{
+			poll(ctx, eg, client, opts),
+		}
+	} else {
+		pollingCtx, cancelPolling := context.WithCancel(ctx)
+		streams = []<-chan logs.LogEntry{
+			poll(pollingCtx, eg, client, opts),
+			nats(ctx, eg, client, opts, cancelPolling),
+		}
+	}
 
 	eg.Go(func() error {
-		return printStreams(ctx, pollEntries, liveEntries)
+		return printStreams(ctx, streams...)
 	})
 
 	return eg.Wait()
 }
 
-func poll(ctx context.Context, eg *errgroup.Group, client *api.Client, opts *logs.LogOptions) <-chan logs.LogEntry {
+func poll(ctx context.Context, eg *errgroup.Group, client flyutil.Client, opts *logs.LogOptions) <-chan logs.LogEntry {
 	c := make(chan logs.LogEntry)
 
 	eg.Go(func() (err error) {
@@ -98,7 +115,7 @@ func poll(ctx context.Context, eg *errgroup.Group, client *api.Client, opts *log
 	return c
 }
 
-func nats(ctx context.Context, eg *errgroup.Group, client *api.Client, opts *logs.LogOptions, cancelPolling context.CancelFunc) <-chan logs.LogEntry {
+func nats(ctx context.Context, eg *errgroup.Group, client flyutil.Client, opts *logs.LogOptions, cancelPolling context.CancelFunc) <-chan logs.LogEntry {
 	c := make(chan logs.LogEntry)
 
 	eg.Go(func() error {
@@ -143,7 +160,6 @@ func printStreams(ctx context.Context, streams ...<-chan logs.LogEntry) error {
 			return printStream(ctx, out, stream, json)
 		})
 	}
-
 	return eg.Wait()
 }
 

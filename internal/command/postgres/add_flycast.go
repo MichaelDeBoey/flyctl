@@ -4,16 +4,15 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/AlecAivazis/survey/v2"
 	"github.com/spf13/cobra"
-	"github.com/superfly/flyctl/api"
-	"github.com/superfly/flyctl/client"
+	fly "github.com/superfly/fly-go"
 	"github.com/superfly/flyctl/internal/appconfig"
 	"github.com/superfly/flyctl/internal/command"
 	"github.com/superfly/flyctl/internal/command/apps"
 	"github.com/superfly/flyctl/internal/flag"
+	"github.com/superfly/flyctl/internal/flyutil"
 	mach "github.com/superfly/flyctl/internal/machine"
-	"github.com/superfly/flyctl/iostreams"
+	"github.com/superfly/flyctl/internal/prompt"
 )
 
 func newAddFlycast() *cobra.Command {
@@ -42,9 +41,8 @@ func newAddFlycast() *cobra.Command {
 
 func runAddFlycast(ctx context.Context) error {
 	var (
-		client  = client.FromContext(ctx).API()
+		client  = flyutil.ClientFromContext(ctx)
 		appName = appconfig.NameFromContext(ctx)
-		io      = iostreams.FromContext(ctx)
 	)
 
 	app, err := client.GetAppCompact(ctx, appName)
@@ -61,18 +59,10 @@ func runAddFlycast(ctx context.Context) error {
 		return err
 	}
 
-	switch app.PlatformVersion {
-	case "machines":
-		if err := doAddFlycast(ctx); err != nil {
-			return err
-		}
-
-		fmt.Fprintln(io.Out, "Flycast added!")
-	case "nomad":
-		return fmt.Errorf("not supported on nomad")
-	default:
-		return fmt.Errorf("unknown platform version")
+	if err := doAddFlycast(ctx); err != nil {
+		return err
 	}
+
 	return nil
 }
 
@@ -91,12 +81,10 @@ func doAddFlycast(ctx context.Context) error {
 			}
 		}
 
-		confirm := false
-		prompt := &survey.Confirm{
-			Message: "This will overwrite existing services you have manually added. Continue?",
-			Default: true,
-		}
-		if err := survey.AskOne(prompt, &confirm); err != nil {
+		message := "This will overwrite existing services you have manually added. Continue?"
+
+		confirm, err := prompt.Confirm(ctx, message)
+		if err != nil {
 			return err
 		}
 
@@ -105,39 +93,38 @@ func doAddFlycast(ctx context.Context) error {
 		}
 
 		conf := machine.Config
-		conf.Services =
-			[]api.MachineService{
-				{
-					Protocol:     "tcp",
-					InternalPort: bouncerPort,
-					Ports: []api.MachinePort{
-						{
-							Port: &bouncerPort,
-							Handlers: []string{
-								"pg_tls",
-							},
-							ForceHTTPS: false,
+		conf.Services = []fly.MachineService{
+			{
+				Protocol:     "tcp",
+				InternalPort: bouncerPort,
+				Ports: []fly.MachinePort{
+					{
+						Port: &bouncerPort,
+						Handlers: []string{
+							"pg_tls",
 						},
+						ForceHTTPS: false,
 					},
-					Concurrency: nil,
 				},
-				{
-					Protocol:     "tcp",
-					InternalPort: pgPort,
-					Ports: []api.MachinePort{
-						{
-							Port: &pgPort,
-							Handlers: []string{
-								"pg_tls",
-							},
-							ForceHTTPS: false,
+				Concurrency: nil,
+			},
+			{
+				Protocol:     "tcp",
+				InternalPort: pgPort,
+				Ports: []fly.MachinePort{
+					{
+						Port: &pgPort,
+						Handlers: []string{
+							"pg_tls",
 						},
+						ForceHTTPS: false,
 					},
-					Concurrency: nil,
 				},
-			}
+				Concurrency: nil,
+			},
+		}
 
-		err = mach.Update(ctx, machine, &api.LaunchMachineInput{
+		err = mach.Update(ctx, machine, &fly.LaunchMachineInput{
 			Config: conf,
 		})
 		if err != nil {

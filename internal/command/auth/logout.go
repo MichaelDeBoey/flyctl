@@ -7,12 +7,14 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/superfly/flyctl/agent"
-	"github.com/superfly/flyctl/iostreams"
-
+	"github.com/superfly/flyctl/gql"
 	"github.com/superfly/flyctl/internal/command"
 	"github.com/superfly/flyctl/internal/config"
 	"github.com/superfly/flyctl/internal/env"
+	"github.com/superfly/flyctl/internal/flyutil"
+	"github.com/superfly/flyctl/internal/logger"
 	"github.com/superfly/flyctl/internal/state"
+	"github.com/superfly/flyctl/iostreams"
 )
 
 func newLogout() *cobra.Command {
@@ -23,11 +25,22 @@ To continue interacting with Fly, the user will need to log in again.
 		short = "Logs out the currently logged in user"
 	)
 
-	return command.New("logout", short, long, runLogout,
-		command.RequireSession)
+	return command.New("logout", short, long, runLogout)
 }
 
 func runLogout(ctx context.Context) (err error) {
+	log := logger.FromContext(ctx)
+
+	if c := flyutil.ClientFromContext(ctx); c.Authenticated() {
+		resp, err := gql.LogOut(ctx, c.GenqClient())
+		if err != nil || !resp.LogOut.Ok {
+			log.Warnf("Unable to revoke token")
+		}
+		if err != nil {
+			log.Debug(err.Error())
+		}
+	}
+
 	var ac *agent.Client
 	if ac, err = agent.DefaultClient(ctx); err == nil {
 		if err = ac.Kill(ctx); err != nil {

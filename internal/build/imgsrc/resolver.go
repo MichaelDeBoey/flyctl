@@ -2,47 +2,99 @@ package imgsrc
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/cenkalti/backoff/v5"
 	"github.com/pkg/errors"
 	"github.com/vektah/gqlparser/v2/gqlerror"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	dockerclient "github.com/docker/docker/client"
-	"github.com/superfly/flyctl/client"
-	"github.com/superfly/flyctl/gql"
+	fly "github.com/superfly/fly-go"
+	"github.com/superfly/flyctl/agent"
 	"github.com/superfly/flyctl/internal/buildinfo"
 	"github.com/superfly/flyctl/internal/config"
+	"github.com/superfly/flyctl/internal/flag"
+	"github.com/superfly/flyctl/internal/flyutil"
 	"github.com/superfly/flyctl/internal/sentry"
+	"github.com/superfly/flyctl/internal/tracing"
 	"github.com/superfly/flyctl/iostreams"
 
-	"github.com/superfly/flyctl/api"
 	"github.com/superfly/flyctl/terminal"
 )
 
 type ImageOptions struct {
-	AppName         string
-	WorkingDir      string
-	DockerfilePath  string
-	IgnorefilePath  string
-	ImageRef        string
-	BuildArgs       map[string]string
-	ExtraBuildArgs  map[string]string
-	BuildSecrets    map[string]string
-	ImageLabel      string
-	Publish         bool
-	Tag             string
-	Target          string
-	NoCache         bool
-	BuiltIn         string
-	BuiltInSettings map[string]interface{}
-	Builder         string
-	Buildpacks      []string
+	AppName              string
+	WorkingDir           string
+	DockerfilePath       string
+	IgnorefilePath       string
+	ImageRef             string
+	BuildArgs            map[string]string
+	ExtraBuildArgs       map[string]string
+	BuildSecrets         map[string]string
+	ImageLabel           string
+	Publish              bool
+	Tag                  string
+	Target               string
+	NoCache              bool
+	BuiltIn              string
+	BuiltInSettings      map[string]interface{}
+	Builder              string
+	Buildpacks           []string
+	Label                map[string]string
+	BuildpacksDockerHost string
+	BuildpacksVolumes    []string
+	UseOverlaybd         bool
+	UseZstd              bool
+}
+
+func (io ImageOptions) ToSpanAttributes() []attribute.KeyValue {
+	attrs := []attribute.KeyValue{
+		attribute.String("imageoptions.app_name", io.AppName),
+		attribute.String("imageoptions.work_dir", io.WorkingDir),
+		attribute.String("imageoptions.dockerfile_path", io.DockerfilePath),
+		attribute.String("imageoptions.ignorefile_path", io.IgnorefilePath),
+		attribute.String("imageoptions.image.ref", io.ImageRef),
+		attribute.String("imageoptions.image.label", io.ImageLabel),
+		attribute.Bool("imageoptions.publish", io.Publish),
+		attribute.String("imageoptions.tag", io.Tag),
+		attribute.Bool("imageoptions.nocache", io.NoCache),
+		attribute.String("imageoptions.builtin", io.BuiltIn),
+		attribute.String("imageoptions.builder", io.BuiltIn),
+		attribute.String("imageoptions.buildpacks_docker_host", io.BuildpacksDockerHost),
+		attribute.StringSlice("imageoptions.buildpacks", io.Buildpacks),
+		attribute.StringSlice("imageoptions.buildpacks_volumes", io.BuildpacksVolumes),
+		attribute.Bool("imageoptions.use_zstd", io.UseZstd),
+	}
+
+	if io.BuildArgs != nil {
+		attrs = append(attrs, attribute.Bool("imageoptions.has_build_args", true))
+	}
+
+	if io.BuildSecrets != nil {
+		attrs = append(attrs, attribute.Bool("imageoptions.has_build_secrets", true))
+	}
+
+	b, err := json.Marshal(io.BuiltInSettings)
+	if err == nil {
+		attrs = append(attrs, attribute.String("imageoptions.built_in_settings", string(b)))
+	}
+
+	b, err = json.Marshal(io.Label)
+	if err == nil {
+		attrs = append(attrs, attribute.String("imageoptions.labels", string(b)))
+	}
+
+	return attrs
 }
 
 type RefOptions struct {
@@ -54,15 +106,52 @@ type RefOptions struct {
 	Tag        string
 }
 
+func (ro RefOptions) ToSpanAttributes() []attribute.KeyValue {
+	return []attribute.KeyValue{
+		attribute.String("refoptions.app_name", ro.AppName),
+		attribute.String("refoptions.work_dir", ro.WorkingDir),
+		attribute.String("refoptions.image.ref", ro.ImageRef),
+		attribute.String("refoptions.image.label", ro.ImageLabel),
+		attribute.Bool("refoptions.publish", ro.Publish),
+		attribute.String("refoptions.tag", ro.Tag),
+	}
+}
+
 type DeploymentImage struct {
-	ID   string
-	Tag  string
-	Size int64
+	ID      string
+	Tag     string
+	Digest  string
+	Size    int64
+	BuildID string
+	Labels  map[string]string
+}
+
+func (image *DeploymentImage) String() string {
+	if image.Digest == "" {
+		return image.Tag
+	}
+	return fmt.Sprintf("%s@%s", image.Tag, image.Digest)
+}
+
+func (di DeploymentImage) ToSpanAttributes() []attribute.KeyValue {
+	attrs := []attribute.KeyValue{
+		attribute.String("image.id", di.ID),
+		attribute.String("image.tag", di.Tag),
+		attribute.Int64("image.size", di.Size),
+	}
+
+	b, err := json.Marshal(di.Labels)
+	if err == nil {
+		attrs = append(attrs, attribute.String("image.labels", string(b)))
+	}
+
+	return attrs
 }
 
 type Resolver struct {
 	dockerFactory *dockerClientFactory
-	apiClient     *api.Client
+	apiClient     flyutil.Client
+	heartbeatFn   func(ctx context.Context, client *dockerclient.Client, req *http.Request) error
 }
 
 type StopSignal struct {
@@ -75,6 +164,9 @@ const logLimit int = 4096
 
 // ResolveReference returns an Image give an reference using either the local docker daemon or remote registry
 func (r *Resolver) ResolveReference(ctx context.Context, streams *iostreams.IOStreams, opts RefOptions) (img *DeploymentImage, err error) {
+	ctx, span := tracing.GetTracer().Start(ctx, "resolve_reference")
+	defer span.End()
+
 	strategies := []imageResolver{
 		&localImageResolver{},
 		&remoteImageResolver{flyApi: r.apiClient},
@@ -82,6 +174,7 @@ func (r *Resolver) ResolveReference(ctx context.Context, streams *iostreams.IOSt
 
 	bld, err := r.createImageBuild(ctx, strategies, opts)
 	if err != nil {
+		span.AddEvent(fmt.Sprintf("failed to create image build. err=%s", err.Error()))
 		terminal.Warnf("failed to create build in graphql: %v\n", err)
 	}
 
@@ -101,31 +194,62 @@ func (r *Resolver) ResolveReference(ctx context.Context, streams *iostreams.IOSt
 		if img != nil {
 			bld.BuildAndPushFinish()
 			bld.FinishImageStrategy(s, false /* success */, nil, note)
-			r.finishBuild(ctx, bld, false /* completed */, "", img)
+			buildResult, err := r.finishBuild(ctx, bld, false /* completed */, "", img)
+			if err == nil && buildResult != nil {
+				// we should only set the image's buildID if we push the build info to web
+				img.BuildID = buildResult.BuildId
+			}
+
 			return img, nil
 		}
 		bld.BuildAndPushFinish()
 		bld.FinishImageStrategy(s, true /* failed */, nil, note)
+		span.AddEvent(fmt.Sprintf("failed to resolve image with strategy %s", s.Name()))
+
 	}
 
 	r.finishBuild(ctx, bld, true /* failed */, "no strategies resulted in an image", nil)
-	return nil, fmt.Errorf("could not find image \"%s\"", opts.ImageRef)
+	err = fmt.Errorf("could not find image %q", opts.ImageRef)
+	tracing.RecordError(span, err, "failed to resolve image")
+	return nil, err
 }
 
 // BuildImage converts source code to an image using a Dockerfile, buildpacks, or builtins.
 func (r *Resolver) BuildImage(ctx context.Context, streams *iostreams.IOStreams, opts ImageOptions) (img *DeploymentImage, err error) {
+	ctx, span := tracing.GetTracer().Start(ctx, "build_image", trace.WithAttributes(opts.ToSpanAttributes()...))
+	defer span.End()
+
 	if !r.dockerFactory.mode.IsAvailable() {
-		return nil, errors.New("docker is unavailable to build the deployment image")
+		err := errors.New("docker is unavailable to build the deployment image")
+		tracing.RecordError(span, err, "docker is unavailable to build the deployment image")
+		return nil, err
 	}
 
 	if opts.Tag == "" {
 		opts.Tag = NewDeploymentTag(opts.AppName, opts.ImageLabel)
 	}
 
+	span.SetAttributes(attribute.String("tag", opts.Tag))
+
 	strategies := []imageBuilder{}
+
+	var builderScope depotBuilderScope
+	builderScopeString := flag.GetString(ctx, "depot-scope")
+
+	switch builderScopeString {
+	case "org", "":
+		builderScope = DepotBuilderScopeOrganization
+	case "app":
+		builderScope = DepotBuilderScopeApp
+	default:
+		return nil, fmt.Errorf("invalid depot-scope value. must be 'org' or 'app'")
+
+	}
 
 	if r.dockerFactory.mode.UseNixpacks() {
 		strategies = append(strategies, &nixpacksBuilder{})
+	} else if r.dockerFactory.mode.UseDepot() && len(opts.Buildpacks) == 0 && opts.Builder == "" && opts.BuiltIn == "" {
+		strategies = append(strategies, &DepotBuilder{Scope: builderScope})
 	} else {
 		strategies = []imageBuilder{
 			&buildpacksBuilder{},
@@ -133,6 +257,14 @@ func (r *Resolver) BuildImage(ctx context.Context, streams *iostreams.IOStreams,
 			&builtinBuilder{},
 		}
 	}
+
+	strategiesString := []string{}
+	for _, strategy := range strategies {
+		strategiesString = append(strategiesString, strategy.Name())
+	}
+
+	span.SetAttributes(attribute.String("strategies", strings.Join(strategiesString, ",")))
+
 	bld, err := r.createBuild(ctx, strategies, opts)
 	if err != nil {
 		terminal.Warnf("failed to create build in graphql: %v\n", err)
@@ -153,7 +285,12 @@ func (r *Resolver) BuildImage(ctx context.Context, streams *iostreams.IOStreams,
 		if img != nil {
 			bld.BuildAndPushFinish()
 			bld.FinishStrategy(s, false /* success */, nil, note)
-			r.finishBuild(ctx, bld, false /* completed */, "", img)
+			buildResult, err := r.finishBuild(ctx, bld, false /* completed */, "", img)
+			if err == nil && buildResult != nil {
+				// we should only set the image's buildID if we push the build info to web
+				img.BuildID = buildResult.BuildId
+			}
+
 			return img, nil
 		}
 		bld.BuildAndPushFinish()
@@ -169,7 +306,7 @@ func (r *Resolver) createImageBuild(ctx context.Context, strategies []imageResol
 	for _, r := range strategies {
 		strategiesAvailable = append(strategiesAvailable, r.Name())
 	}
-	imageOps := &gql.BuildImageOptsInput{
+	imageOps := &fly.BuildImageOptsInput{
 		ImageLabel: opts.ImageLabel,
 		ImageRef:   opts.ImageRef,
 		Publish:    opts.Publish,
@@ -183,7 +320,7 @@ func (r *Resolver) createBuild(ctx context.Context, strategies []imageBuilder, o
 	for _, s := range strategies {
 		strategiesAvailable = append(strategiesAvailable, s.Name())
 	}
-	imageOpts := &gql.BuildImageOptsInput{
+	imageOpts := &fly.BuildImageOptsInput{
 		BuildArgs:       opts.BuildArgs,
 		BuildPacks:      opts.Buildpacks,
 		Builder:         opts.Builder,
@@ -201,33 +338,36 @@ func (r *Resolver) createBuild(ctx context.Context, strategies []imageBuilder, o
 	return r.createBuildGql(ctx, strategiesAvailable, imageOpts)
 }
 
-func (r *Resolver) createBuildGql(ctx context.Context, strategiesAvailable []string, imageOpts *gql.BuildImageOptsInput) (*build, error) {
-	gqlClient := client.FromContext(ctx).API().GenqClient
-	_ = `# @genqlient
-	mutation ResolverCreateBuild($input:CreateBuildInput!) {
-		createBuild(input:$input) {
-			id
-			status
-		}
+func (r *Resolver) createBuildGql(ctx context.Context, strategiesAvailable []string, imageOpts *fly.BuildImageOptsInput) (*build, error) {
+	ctx, span := tracing.GetTracer().Start(ctx, "web.create_build")
+	defer span.End()
+
+	client := flyutil.ClientFromContext(ctx)
+
+	builderType := "remote"
+	switch {
+	case r.dockerFactory.mode.PrefersLocal():
+		builderType = "local"
+	case r.dockerFactory.mode.UseDepot():
+		builderType = "depot.dev"
+	case r.dockerFactory.mode.UseNixpacks():
+		builderType = "local"
 	}
-	`
-	builderType := "local"
-	if r.dockerFactory.remote {
-		builderType = "remote"
-	}
-	input := gql.CreateBuildInput{
+
+	input := fly.CreateBuildInput{
 		AppName:             r.dockerFactory.appName,
 		BuilderType:         builderType,
 		ImageOpts:           *imageOpts,
 		MachineId:           "",
 		StrategiesAvailable: strategiesAvailable,
 	}
-	resp, err := gql.ResolverCreateBuild(ctx, gqlClient, input)
+	resp, err := client.CreateBuild(ctx, input)
 	if err != nil {
 		var gqlErr *gqlerror.Error
 		isAppNotFoundErr := errors.As(err, &gqlErr) && gqlErr.Path.String() == "createBuild" && gqlErr.Message == "Could not find App"
 		if !isAppNotFoundErr {
 			sentry.CaptureException(err,
+				sentry.WithTraceID(ctx),
 				sentry.WithTag("feature", "build-api-create-build"),
 				sentry.WithContexts(map[string]sentry.Context{
 					"app": map[string]interface{}{
@@ -239,6 +379,8 @@ func (r *Resolver) createBuildGql(ctx context.Context, strategiesAvailable []str
 				}),
 			)
 		}
+		span.SetAttributes(attribute.Bool("is_app_not_found_error", isAppNotFoundErr))
+		tracing.RecordError(span, err, "failed to create build")
 		return newFailedBuild(), err
 	}
 
@@ -257,10 +399,10 @@ func limitLogs(log string) string {
 type build struct {
 	CreateApiFailed bool
 	BuildId         string
-	BuilderMeta     *gql.BuilderMetaInput
-	StrategyResults []gql.BuildStrategyAttemptInput
-	Timings         *gql.BuildTimingsInput
-	StartTimes      *gql.BuildTimingsInput
+	BuilderMeta     *fly.BuilderMetaInput
+	StrategyResults []fly.BuildStrategyAttemptInput
+	Timings         *fly.BuildTimingsInput
+	StartTimes      *fly.BuildTimingsInput
 }
 
 func newFailedBuild() *build {
@@ -271,10 +413,10 @@ func newBuild(buildId string, createApiFailed bool) *build {
 	return &build{
 		CreateApiFailed: createApiFailed,
 		BuildId:         buildId,
-		BuilderMeta:     &gql.BuilderMetaInput{},
-		StrategyResults: make([]gql.BuildStrategyAttemptInput, 0),
-		StartTimes:      &gql.BuildTimingsInput{},
-		Timings: &gql.BuildTimingsInput{
+		BuilderMeta:     &fly.BuilderMetaInput{},
+		StrategyResults: make([]fly.BuildStrategyAttemptInput, 0),
+		StartTimes:      &fly.BuildTimingsInput{},
+		Timings: &fly.BuildTimingsInput{
 			BuildAndPushMs: -1,
 			BuilderInitMs:  -1,
 			BuildMs:        -1,
@@ -285,15 +427,20 @@ func newBuild(buildId string, createApiFailed bool) *build {
 	}
 }
 
-func (b *build) SetBuilderMetaPart1(remote bool, remoteAppName string, remoteMachineId string) {
+type builderType string
+
+const (
+	remoteBuilderType builderType = "remote"
+	localBuilderType  builderType = "local"
+	depotBuilderType  builderType = "depot.dev"
+)
+
+func (b *build) SetBuilderMetaPart1(builderType builderType, remoteAppName string, remoteMachineId string) {
 	if b == nil {
 		return
 	}
-	builderType := "remote"
-	if !remote {
-		builderType = "local"
-	}
-	b.BuilderMeta.BuilderType = builderType
+
+	b.BuilderMeta.BuilderType = string(builderType)
 	b.BuilderMeta.RemoteAppName = remoteAppName
 	b.BuilderMeta.RemoteMachineId = remoteMachineId
 }
@@ -306,8 +453,8 @@ func (b *build) SetBuilderMetaPart2(buildkitEnabled bool, dockerVersion string, 
 
 // call this at the start of each strategy to restart all the timers
 func (b *build) ResetTimings() {
-	b.StartTimes = &gql.BuildTimingsInput{}
-	b.Timings = &gql.BuildTimingsInput{
+	b.StartTimes = &fly.BuildTimingsInput{}
+	b.Timings = &fly.BuildTimingsInput{
 		BuildAndPushMs: -1,
 		BuilderInitMs:  -1,
 		BuildMs:        -1,
@@ -374,7 +521,7 @@ func (b *build) finishStrategyCommon(strategy string, failed bool, err error, no
 	if err != nil {
 		errMsg = err.Error()
 	}
-	r := gql.BuildStrategyAttemptInput{
+	r := fly.BuildStrategyAttemptInput{
 		Strategy: strategy,
 		Result:   result,
 		Error:    limitLogs(errMsg),
@@ -402,21 +549,13 @@ func (r *Resolver) finishBuild(ctx context.Context, build *build, failed bool, l
 		terminal.Debug("Skipping FinishBuild() gql call, because CreateBuild() failed.\n")
 		return nil, nil
 	}
-	gqlClient := client.FromContext(ctx).API().GenqClient
-	_ = `# @genqlient
-	mutation ResolverFinishBuild($input:FinishBuildInput!) {
-		finishBuild(input:$input) {
-			id
-			status
-			wallclockTimeMs
-		}
-	}
-	`
+	client := flyutil.ClientFromContext(ctx)
+
 	status := "failed"
 	if !failed {
 		status = "completed"
 	}
-	input := gql.FinishBuildInput{
+	input := fly.FinishBuildInput{
 		BuildId:             build.BuildId,
 		AppName:             r.dockerFactory.appName,
 		MachineId:           "",
@@ -427,16 +566,17 @@ func (r *Resolver) finishBuild(ctx context.Context, build *build, failed bool, l
 		Timings:             *build.Timings,
 	}
 	if img != nil {
-		input.FinalImage = gql.BuildFinalImageInput{
+		input.FinalImage = fly.BuildFinalImageInput{
 			Id:        img.ID,
 			Tag:       img.Tag,
 			SizeBytes: img.Size,
 		}
 	}
-	resp, err := gql.ResolverFinishBuild(ctx, gqlClient, input)
+	resp, err := client.FinishBuild(ctx, input)
 	if err != nil {
 		terminal.Warnf("failed to finish build in graphql: %v\n", err)
 		sentry.CaptureException(err,
+			sentry.WithTraceID(ctx),
 			sentry.WithTag("feature", "build-api-finish-build"),
 			sentry.WithContexts(map[string]sentry.Context{
 				"app": map[string]interface{}{
@@ -472,19 +612,32 @@ func (e httpError) Error() string {
 	return fmt.Sprintf("%s (http: %d)", e.Body, e.StatusCode)
 }
 
-func heartbeat(client *dockerclient.Client, req *http.Request) error {
-	resp, err := client.HTTPClient().Do(req)
+func heartbeat(ctx context.Context, client *dockerclient.Client, req *http.Request) error {
+	ctx, span := tracing.GetTracer().Start(ctx, "heartbeat")
+	defer span.End()
+
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	resp, err := client.HTTPClient().Do(req.Clone(ctx))
 	if err != nil {
+		tracing.RecordError(span, err, "failed to check heartbeat")
 		return err
 	}
 	defer resp.Body.Close() // skipcq: GO-S2307
 
+	span.SetAttributes(attribute.Int("status_code", resp.StatusCode))
 	if 200 <= resp.StatusCode && resp.StatusCode < 300 {
 		return nil
 	}
 
+	if resp.StatusCode == http.StatusNotFound {
+		tracing.RecordError(span, err, "no heartbeat endpoint")
+	}
+
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
+		tracing.RecordError(span, err, "failed to read response body")
 		return &httpError{StatusCode: resp.StatusCode, Body: err.Error()}
 	}
 
@@ -494,32 +647,45 @@ func heartbeat(client *dockerclient.Client, req *http.Request) error {
 // For remote builders send a periodic heartbeat during build to ensure machine stays alive
 // This is a noop for local builders
 func (r *Resolver) StartHeartbeat(ctx context.Context) (*StopSignal, error) {
-	if !r.dockerFactory.remote {
+	ctx, span := tracing.GetTracer().Start(ctx, "start_heartbeat")
+	defer span.End()
+
+	if !r.dockerFactory.remote || r.dockerFactory.mode.UseDepot() {
+		span.AddEvent("won't check heartbeart of non-remote build")
 		return nil, nil
 	}
+
+	span.SetAttributes(attribute.String("builder_app_name", r.dockerFactory.appName))
 
 	errMsg := "Failed to start remote builder heartbeat: %v\n"
 	dockerClient, err := r.dockerFactory.buildFn(ctx, nil)
 	if err != nil {
 		terminal.Warnf(errMsg, err)
-		return nil, nil
+		return nil, err
 	}
 	heartbeatUrl, err := getHeartbeatUrl(dockerClient)
 	if err != nil {
 		terminal.Warnf(errMsg, err)
-		return nil, nil
+		tracing.RecordError(span, err, "failed to get heartbeaturl")
+		return nil, err
 	}
+
+	span.SetAttributes(attribute.String("heartbeat_url", heartbeatUrl))
 	heartbeatReq, err := http.NewRequestWithContext(ctx, http.MethodGet, heartbeatUrl, http.NoBody)
 	if err != nil {
 		terminal.Warnf(errMsg, err)
-		return nil, nil
+		tracing.RecordError(span, err, "failed to get http request")
+		return nil, err
 	}
-	heartbeatReq.SetBasicAuth(r.dockerFactory.appName, config.FromContext(ctx).AccessToken)
+	heartbeatReq.SetBasicAuth(r.dockerFactory.appName, config.Tokens(ctx).Docker())
 	heartbeatReq.Header.Set("User-Agent", fmt.Sprintf("flyctl/%s", buildinfo.Version().String()))
 
 	terminal.Debugf("Sending remote builder heartbeat pulse to %s...\n", heartbeatUrl)
 
-	err = heartbeat(dockerClient, heartbeatReq)
+	span.AddEvent("sending first heartbeat")
+	_, err = backoff.Retry(ctx, func() (any, error) {
+		return nil, r.heartbeatFn(ctx, dockerClient, heartbeatReq)
+	}, backoff.WithMaxTries(3))
 	if err != nil {
 		var h *httpError
 		if errors.As(err, &h) {
@@ -528,21 +694,14 @@ func (r *Resolver) StartHeartbeat(ctx context.Context) (*StopSignal, error) {
 				return nil, nil
 			}
 		} else {
-			terminal.Debugf("not http error: err = %+v", err)
+			terminal.Debugf("Remote builder heartbeat pulse failed, not going to run heartbeat: %v\n", err)
 		}
-		return nil, err
+		tracing.RecordError(span, err, "Remote builder heartbeat pulse failed, not going to run heartbeat")
+		return nil, fmt.Errorf("failed to send first heartbeat: %w", err)
 	}
 
-	resp, err := dockerClient.HTTPClient().Do(heartbeatReq)
-	if err != nil {
-		terminal.Debugf("Remote builder heartbeat pulse failed, not going to run heartbeat: %v\n", err)
-		return nil, nil
-	} else if resp.StatusCode != http.StatusAccepted {
-		terminal.Debugf("Unexpected remote builder heartbeat response, not going to run heartbeat: %s\n", resp.Status)
-		return nil, nil
-	}
-
-	pulseInterval := 30 * time.Second
+	// We timeout on idleness every 10 minutes on the server, so sending a pulse every 2 minutes to make sure we don't get timed out seems cool
+	pulseInterval := 2 * time.Minute
 	maxTime := 1 * time.Hour
 
 	done := StopSignal{Chan: make(chan struct{})}
@@ -554,6 +713,8 @@ func (r *Resolver) StartHeartbeat(ctx context.Context) (*StopSignal, error) {
 		defer pulse.Stop()
 		defer done.Stop()
 
+		var consecutiveTunnelErrors int
+
 		for {
 			select {
 			case <-done.Chan:
@@ -562,9 +723,20 @@ func (r *Resolver) StartHeartbeat(ctx context.Context) (*StopSignal, error) {
 				return
 			case <-pulse.C:
 				terminal.Debugf("Sending remote builder heartbeat pulse to %s...\n", heartbeatUrl)
-				err := heartbeat(dockerClient, heartbeatReq)
+				err := r.heartbeatFn(ctx, dockerClient, heartbeatReq)
 				if err != nil {
-					terminal.Debugf("Remote builder heartbeat pulse failed: %v\n", err)
+					if errors.Is(err, agent.ErrTunnelUnavailable) {
+						consecutiveTunnelErrors++
+					}
+
+					wglessSuggestion := ""
+					if consecutiveTunnelErrors >= 3 {
+						wglessSuggestion = "(Your wireguard tunnel seems broken. Retry your deployment with `fly deploy --wg=false`)"
+					}
+
+					terminal.Debugf("Remote builder heartbeat pulse failed: %v%s\n", err, wglessSuggestion)
+				} else {
+					consecutiveTunnelErrors = 0
 				}
 			}
 		}
@@ -595,10 +767,11 @@ func (s *StopSignal) Stop() {
 	})
 }
 
-func NewResolver(daemonType DockerDaemonType, apiClient *api.Client, appName string, iostreams *iostreams.IOStreams) *Resolver {
+func NewResolver(daemonType DockerDaemonType, apiClient flyutil.Client, appName string, iostreams *iostreams.IOStreams, connectOverWireguard, recreateBuilder bool) *Resolver {
 	return &Resolver{
-		dockerFactory: newDockerClientFactory(daemonType, apiClient, appName, iostreams),
+		dockerFactory: newDockerClientFactory(daemonType, apiClient, appName, iostreams, connectOverWireguard, recreateBuilder),
 		apiClient:     apiClient,
+		heartbeatFn:   heartbeat,
 	}
 }
 

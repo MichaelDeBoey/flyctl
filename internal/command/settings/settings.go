@@ -10,6 +10,8 @@ func New() *cobra.Command {
 
 	cmd.AddCommand(
 		newAnalytics(),
+		newAutoUpdate(),
+		newSynthetics(),
 	)
 
 	return cmd

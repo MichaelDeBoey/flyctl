@@ -4,17 +4,19 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/docker/go-units"
 	"github.com/samber/lo"
-	"github.com/superfly/flyctl/api"
+	fly "github.com/superfly/fly-go"
+	"github.com/superfly/flyctl/helpers"
 	"github.com/superfly/flyctl/internal/prompt"
 )
 
-func (md *machineDeployment) provisionFirstDeploy(ctx context.Context, allocPublicIPs bool) error {
+func (md *machineDeployment) provisionFirstDeploy(ctx context.Context, ipType string, org string) error {
 	if !md.isFirstDeploy || md.restartOnly {
 		return nil
 	}
-	if err := md.provisionIpsOnFirstDeploy(ctx, allocPublicIPs); err != nil {
-		fmt.Fprintf(md.io.ErrOut, "Failed to provision IP addresses, use `fly ips` commands to remmediate it. ERROR: %s", err)
+	if err := md.provisionIpsOnFirstDeploy(ctx, ipType, org); err != nil {
+		fmt.Fprintf(md.io.ErrOut, "Failed to provision IP addresses. Use `fly ips` commands to remediate it. ERROR: %s", err)
 	}
 	if err := md.provisionVolumesOnFirstDeploy(ctx); err != nil {
 		return fmt.Errorf("failed to provision seed volumes: %w", err)
@@ -22,9 +24,9 @@ func (md *machineDeployment) provisionFirstDeploy(ctx context.Context, allocPubl
 	return nil
 }
 
-func (md *machineDeployment) provisionIpsOnFirstDeploy(ctx context.Context, allocPublicIPs bool) error {
+func (md *machineDeployment) provisionIpsOnFirstDeploy(ctx context.Context, ipType string, org string) error {
 	// Provision only if the app hasn't been deployed and have services defined
-	if !md.isFirstDeploy || len(md.appConfig.AllServices()) == 0 || !allocPublicIPs {
+	if !md.isFirstDeploy || len(md.appConfig.AllServices()) == 0 || ipType == "none" {
 		return nil
 	}
 
@@ -37,8 +39,8 @@ func (md *machineDeployment) provisionIpsOnFirstDeploy(ctx context.Context, allo
 		return nil
 	}
 
-	switch md.appConfig.HasNonHttpAndHttpsStandardServices() {
-	case true:
+	switch md.appConfig.DetermineIPType(ipType) {
+	case "dedicated":
 		hasUdpService := md.appConfig.HasUdpService()
 
 		ipStuffStr := "a dedicated ipv4 address"
@@ -63,7 +65,7 @@ func (md *machineDeployment) provisionIpsOnFirstDeploy(ctx context.Context, allo
 			}
 		}
 
-	case false:
+	case "shared":
 		fmt.Fprintf(md.io.Out, "Provisioning ips for %s\n", md.colorize.Bold(md.app.Name))
 		v6Addr, err := md.apiClient.AllocateIPAddress(ctx, md.app.Name, "v6", "", nil, "")
 		if err != nil {
@@ -77,8 +79,17 @@ func (md *machineDeployment) provisionIpsOnFirstDeploy(ctx context.Context, allo
 		}
 		fmt.Fprintf(md.io.Out, "  Shared ipv4: %s\n", v4Shared)
 		fmt.Fprintf(md.io.Out, "  Add a dedicated ipv4 with: fly ips allocate-v4\n")
+
+	case "private":
+		fmt.Fprintf(md.io.Out, "Provisioning ip address for %s\n", md.colorize.Bold(md.app.Name))
+		v6Addr, err := md.apiClient.AllocateIPAddress(ctx, md.app.Name, "private_v6", org, nil, "")
+		if err != nil {
+			return fmt.Errorf("error allocating ipv6 after detecting first deploy and presence of services: %w", err)
+		}
+		fmt.Fprintf(md.io.Out, "  Private ipv6: %s\n", v6Addr.Address)
 	}
 
+	fmt.Fprintln(md.io.Out)
 	return nil
 }
 
@@ -89,7 +100,7 @@ func (md *machineDeployment) provisionVolumesOnFirstDeploy(ctx context.Context) 
 	}
 
 	// md.setVolumes already queried for existent unattached volumes, do not create more
-	existentVolumes := lo.MapValues(md.volumes, func(vs []api.Volume, _ string) int {
+	existentVolumes := lo.MapValues(md.volumes, func(vs []fly.Volume, _ string) int {
 		return len(vs)
 	})
 
@@ -100,25 +111,54 @@ func (md *machineDeployment) provisionVolumesOnFirstDeploy(ctx context.Context) 
 			return err
 		}
 
+		mConfig, err := md.appConfig.ToMachineConfig(groupName, nil)
+		if err != nil {
+			return err
+		}
+		guest := md.machineGuest
+		if mConfig.Guest != nil {
+			guest = mConfig.Guest
+		}
+
 		for _, m := range groupConfig.Mounts {
 			if v := existentVolumes[m.Source]; v > 0 {
 				existentVolumes[m.Source]--
 				continue
 			}
 
-			fmt.Fprintf(md.io.Out, "Creating 1GB volume '%s' for process group '%s'. Use 'fly vol extend' to increase its size\n", m.Source, groupName)
-
-			input := api.CreateVolumeInput{
-				AppID:     md.app.ID,
-				Name:      m.Source,
-				Region:    groupConfig.PrimaryRegion,
-				SizeGb:    1,
-				Encrypted: true,
+			var initialSize int
+			switch {
+			case m.InitialSize != "":
+				// Ignore the error because invalid values are caught at config validation time
+				initialSize, _ = helpers.ParseSize(m.InitialSize, units.FromHumanSize, units.GB)
+			case md.volumeInitialSize > 0:
+				initialSize = md.volumeInitialSize
+			case guest != nil && guest.GPUKind != "":
+				initialSize = DefaultGPUVolumeInitialSizeGB
+			default:
+				initialSize = DefaultVolumeInitialSizeGB
 			}
 
-			vol, err := md.apiClient.CreateVolume(ctx, input)
+			fmt.Fprintf(
+				md.io.Out,
+				"Creating a %d GB volume named '%s' for process group '%s'. "+
+					"Use 'fly vol extend' to increase its size\n",
+				initialSize, m.Source, groupName,
+			)
+
+			input := fly.CreateVolumeRequest{
+				Name:                m.Source,
+				Region:              groupConfig.PrimaryRegion,
+				SizeGb:              fly.Pointer(initialSize),
+				Encrypted:           fly.Pointer(true),
+				ComputeRequirements: guest,
+				ComputeImage:        md.img,
+				SnapshotRetention:   m.SnapshotRetention,
+			}
+
+			vol, err := md.flapsClient.CreateVolume(ctx, input)
 			if err != nil {
-				return fmt.Errorf("failed creating volume: %w", err)
+				return err
 			}
 
 			md.volumes[m.Source] = append(md.volumes[m.Source], *vol)

@@ -2,12 +2,14 @@ package flag
 
 import (
 	"context"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/spf13/pflag"
+	"github.com/superfly/flyctl/internal/env"
 	"github.com/superfly/flyctl/internal/flag/flagctx"
 	"github.com/superfly/flyctl/internal/flag/flagnames"
-	"golang.org/x/exp/slices"
 )
 
 // NewContext derives a context that carries fs from ctx.
@@ -60,6 +62,16 @@ func GetInt(ctx context.Context, name string) int {
 	}
 }
 
+// GetFloat64 returns the value of the named int flag ctx carries. It panics
+// in case ctx carries no flags or in case the named flag isn't a float64 one.
+func GetFloat64(ctx context.Context, name string) float64 {
+	if v, err := FromContext(ctx).GetFloat64(name); err != nil {
+		panic(err)
+	} else {
+		return v
+	}
+}
+
 // GetStringArray returns the values of the named string flag ctx carries.
 // Preserves commas (unlike the following `GetStringSlice`): in `--flag x,y` the value is string[]{`x,y`}.
 // This is useful to pass key-value pairs like environment variables or build arguments.
@@ -78,6 +90,21 @@ func GetStringSlice(ctx context.Context, name string) []string {
 		return []string{}
 	} else {
 		return v
+	}
+}
+
+// GetStringSlice returns the values of the named string flag ctx carries. Can
+// be comma separated or passed "by repeated flags": `--flag x,y` is equivalent
+// to `--flag x --flag y`. Strings are trimmed of extra whitespace and empty
+// strings are removed.
+func GetNonEmptyStringSlice(ctx context.Context, name string) []string {
+	if v, err := FromContext(ctx).GetStringSlice(name); err != nil {
+		return []string{}
+	} else {
+		for i := range v {
+			v[i] = strings.TrimSpace(v[i])
+		}
+		return slices.DeleteFunc(v, func(s string) bool { return s == "" })
 	}
 }
 
@@ -108,7 +135,11 @@ func IsSpecified(ctx context.Context, name string) bool {
 
 // GetOrg is shorthand for GetString(ctx, Org).
 func GetOrg(ctx context.Context) string {
-	return GetString(ctx, flagnames.Org)
+	org := GetString(ctx, flagnames.Org)
+	if org == "" {
+		org = env.First("FLY_ORG")
+	}
+	return org
 }
 
 // GetRegion is shorthand for GetString(ctx, Region).
@@ -135,6 +166,11 @@ func GetAppConfigFilePath(ctx context.Context) string {
 	}
 }
 
+// GetBindAddr is shorthand for GetString(ctx, BindAddr).
+func GetBindAddr(ctx context.Context) string {
+	return GetString(ctx, flagnames.BindAddr)
+}
+
 // GetFlagsName returns the name of flags that have been set except unwanted flags.
 func GetFlagsName(ctx context.Context, ignoreFlags []string) []string {
 	flagsName := []string{}
@@ -150,4 +186,8 @@ func GetFlagsName(ctx context.Context, ignoreFlags []string) []string {
 	})
 
 	return flagsName
+}
+
+func GetProcessGroup(ctx context.Context) string {
+	return GetString(ctx, flagnames.ProcessGroup)
 }

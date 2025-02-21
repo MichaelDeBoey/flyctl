@@ -8,9 +8,12 @@ import (
 	"text/template"
 
 	"github.com/pkg/errors"
+	"github.com/superfly/flyctl/internal/appconfig"
+	"github.com/superfly/flyctl/internal/command/launch/plan"
+	"github.com/superfly/flyctl/iostreams"
 )
 
-//go:embed templates templates/*/.dockerignore templates/**/.fly
+//go:embed templates templates/*/.dockerignore templates/**/.fly templates/**/.github
 var content embed.FS
 
 type InitCommand struct {
@@ -32,56 +35,80 @@ type MergeConfigStruct struct {
 	Temporary bool
 }
 
+type DatabaseKind int
+
+const (
+	DatabaseKindNone DatabaseKind = iota
+	DatabaseKindPostgres
+	DatabaseKindMySQL
+	DatabaseKindSqlite
+)
+
 type SourceInfo struct {
-	Family                       string
-	Version                      string
-	DockerfilePath               string
-	BuildArgs                    map[string]string
-	Builder                      string
-	ReleaseCmd                   string
-	DockerCommand                string
-	DockerEntrypoint             string
-	KillSignal                   string
-	Buildpacks                   []string
-	Secrets                      []Secret
-	Files                        []SourceFile
-	Port                         int
-	Env                          map[string]string
-	Statics                      []Static
-	Processes                    map[string]string
-	DeployDocs                   string
-	Notice                       string
-	SkipDeploy                   bool
-	SkipDatabase                 bool
-	Volumes                      []Volume
-	DockerfileAppendix           []string
-	InitCommands                 []InitCommand
-	PostgresInitCommands         []InitCommand
-	PostgresInitCommandCondition bool
-	Concurrency                  map[string]int
-	Callback                     func(appName string, srcInfo *SourceInfo, options map[string]bool) error
-	HttpCheckPath                string
-	HttpCheckHeaders             map[string]string
-	ConsoleCommand               string
-	MergeConfig                  *MergeConfigStruct
+	Family           string
+	Version          string
+	DockerfilePath   string
+	BuildArgs        map[string]string
+	Builder          string
+	ReleaseCmd       string
+	SeedCmd          string
+	DockerCommand    string
+	DockerEntrypoint string
+	KillSignal       string
+	SwapSizeMB       int
+	Buildpacks       []string
+	Secrets          []Secret
+
+	Files                           []SourceFile
+	Port                            int
+	Env                             map[string]string
+	Statics                         []Static
+	Processes                       map[string]string
+	DeployDocs                      string
+	Notice                          string
+	SkipDeploy                      bool
+	SkipDatabase                    bool
+	Volumes                         []Volume
+	DockerfileAppendix              []string
+	InitCommands                    []InitCommand
+	PostgresInitCommands            []InitCommand
+	PostgresInitCommandCondition    bool
+	DatabaseDesired                 DatabaseKind
+	RedisDesired                    bool
+	GitHubActions                   GitHubActionsStruct
+	ObjectStorageDesired            bool
+	OverrideExtensionSecretKeyNames map[string]map[string]string
+	Concurrency                     map[string]int
+	Callback                        func(appName string, srcInfo *SourceInfo, plan *plan.LaunchPlan, flags []string) error
+	HttpCheckPath                   string
+	HttpCheckHeaders                map[string]string
+	ConsoleCommand                  string
+	MergeConfig                     *MergeConfigStruct
+	AutoInstrumentErrors            bool
+	FailureCallback                 func(err error) error
+	Runtime                         plan.RuntimeStruct
+	PostInitCallback                func() error
 }
 
 type SourceFile struct {
 	Path     string
 	Contents []byte
 }
-type Static struct {
-	GuestPath string `toml:"guest_path" json:"guest_path"`
-	UrlPrefix string `toml:"url_prefix" json:"url_prefix"`
-}
-type Volume struct {
-	Source      string   `toml:"source" json:"source,omitempty"`
-	Destination string   `toml:"destination" json:"destination,omitempty"`
-	Processes   []string `json:"processes,omitempty" toml:"processes,omitempty"`
-}
+
+type Static = appconfig.Static
+
+type Volume = appconfig.Mount
+
 type ScannerConfig struct {
 	Mode         string
 	ExistingPort int
+	Colorize     *iostreams.ColorScheme
+}
+
+type GitHubActionsStruct struct {
+	Deploy  bool
+	Secrets bool
+	Files   []SourceFile
 }
 
 func Scan(sourceDir string, config *ScannerConfig) (*SourceInfo, error) {
@@ -91,21 +118,25 @@ func Scan(sourceDir string, config *ScannerConfig) (*SourceInfo, error) {
 		configurePhoenix,
 		configureRails,
 		configureRedwood,
-		configureNodeFramework,
+		configureJsFramework,
 		/* frameworks scanners are placed before generic scanners,
 		   since they might mix languages or have a Dockerfile that
 			 doesn't work with Fly */
 		configureDockerfile,
+		configureBridgetown,
 		configureLucky,
 		configureRuby,
 		configureGo,
 		configureElixir,
+		configureFlask,
 		configurePython,
 		configureDeno,
 		configureNuxt,
 		configureNextJs,
 		configureNode,
 		configureStatic,
+		configureDotnet,
+		configureRust,
 	}
 
 	for _, scanner := range scanners {
@@ -114,6 +145,7 @@ func Scan(sourceDir string, config *ScannerConfig) (*SourceInfo, error) {
 			return nil, err
 		}
 		if si != nil {
+			github_actions(sourceDir, &si.GitHubActions)
 			return si, nil
 		}
 	}
@@ -136,7 +168,6 @@ func templatesExecute(name string, vars map[string]interface{}) (files []SourceF
 		template := template.Must(template.New("name").Parse(string(input)))
 		result := strings.Builder{}
 		err := template.Execute(&result, vars)
-
 		if err != nil {
 			panic(err)
 		}
@@ -160,10 +191,6 @@ func templatesFilter(name string, filter func(input []byte) []byte) (files []Sou
 		}
 
 		data, err := fs.ReadFile(content, path)
-		if err != nil {
-			return err
-		}
-
 		if err != nil {
 			return err
 		}

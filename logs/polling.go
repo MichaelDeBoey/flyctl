@@ -7,16 +7,16 @@ import (
 	"github.com/azazeal/pause"
 	"github.com/pkg/errors"
 
-	"github.com/superfly/flyctl/api"
+	fly "github.com/superfly/fly-go"
 )
 
 type pollingStream struct {
 	err       error
-	apiClient *api.Client
+	apiClient WebClient
 }
 
-func NewPollingStream(client *api.Client, opts *LogOptions) (LogStream, error) {
-	return &pollingStream{apiClient: client}, nil
+func NewPollingStream(client WebClient) LogStream {
+	return &pollingStream{apiClient: client}
 }
 
 func (s *pollingStream) Stream(ctx context.Context, opts *LogOptions) <-chan LogEntry {
@@ -35,7 +35,7 @@ func (s *pollingStream) Err() error {
 	return s.err
 }
 
-func Poll(ctx context.Context, out chan<- LogEntry, client *api.Client, opts *LogOptions) error {
+func Poll(ctx context.Context, out chan<- LogEntry, client WebClient, opts *LogOptions) error {
 	const (
 		minWait = time.Millisecond << 6
 		maxWait = minWait << 6
@@ -61,7 +61,7 @@ func Poll(ctx context.Context, out chan<- LogEntry, client *api.Client, opts *Lo
 				continue
 			case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 				return err
-			case api.IsNotAuthenticatedError(err), api.IsNotFoundError(err):
+			case fly.IsNotAuthenticatedError(err), fly.IsNotFoundError(err):
 				return err
 			case errorCount > 9:
 				return err
@@ -90,6 +90,10 @@ func Poll(ctx context.Context, out chan<- LogEntry, client *api.Client, opts *Lo
 				Timestamp: entry.Timestamp,
 				Meta:      entry.Meta,
 			}
+		}
+
+		if opts.NoTail {
+			return nil
 		}
 	}
 }

@@ -1,24 +1,40 @@
-query GetAddOn($name: String) {
-	addOn(name: $name) {
-		id
-		name
+fragment AddOnData on AddOn {
+	id
+	name
+	primaryRegion
+	status
+	errorMessage
+	metadata
+	options
+}
+
+query GetAddOn($name: String, $provider: String) {
+	addOn(name: $name, provider: $provider) {
+		...AddOnData
 		publicUrl
 		privateIp
 		password
-		token
 		status
 		primaryRegion
 		readRegions
 		options
+		metadata
 		ssoLink
 		organization {
 			slug
 			paidPlan
 		}
+		addOnProvider {
+			...ExtensionProviderData
+		}
+		app {
+			...AppData
+		}
 		addOnPlan {
 			id
 			name
 			displayName
+			description
 		}
 	}
 }
@@ -29,9 +45,24 @@ mutation CreateAddOn($input: CreateAddOnInput!) {
 			name
 			publicUrl
 			ssoLink
-			token
 			environment
 			primaryRegion
+		}
+	}
+}
+
+fragment ExtensionData on AddOn {
+	name
+	ssoLink
+	environment
+	primaryRegion
+}
+
+
+mutation CreateExtension($input: CreateAddOnInput!) {
+	createAddOn(input: $input) {
+		addOn {
+			...ExtensionData
 		}
 	}
 }
@@ -51,24 +82,23 @@ mutation CreateApp($input: CreateAppInput!) {
 	}
 }
 
-mutation CreateTosAgreement($input: CreateExtensionTosAgreementInput!) {
-	createExtensionTosAgreement(input: $input) {
+mutation CreateTosAgreement($providerName: String!) {
+	createExtensionTosAgreement(input: {addOnProviderName: $providerName}) {
 		clientMutationId
 	}
 }
 
-query AgreedToProviderTos($addOnProviderName: String!, $organizationId: ID!) {
-	organization(id: $organizationId) {
-		agreedToProviderTos(providerName: $addOnProviderName)
+query AgreedToProviderTos($addOnProviderName: String!) {
+	viewer {
+		... on User {
+			agreedToProviderTos(providerName: $addOnProviderName)
+		}
 	}
 }
 
 query GetOrganization($slug: String!) {
 	organization(slug: $slug) {
-		id
-		name
-		slug
-		addOnSsoLink
+		...OrganizationData
 	}
 }
 
@@ -83,7 +113,7 @@ query GetAppWithAddons($name: String!, $addOnType: AddOnType!) {
 		...AppData
 		addOns(type: $addOnType) {
 			nodes {
-				name
+				...AddOnData
 			}
 		}
 	}
@@ -97,15 +127,31 @@ query GetAppsByRole($role: String!, $organizationId: ID!) {
 	}
 }
 
+query GetExtensionSsoLink($orgSlug: String!, $provider: String!) {
+	organization(slug: $orgSlug) {
+		extensionSsoLink(provider: $provider)
+	}
+}
+
+fragment OrganizationData on Organization {
+	id
+	slug
+	rawSlug
+	paidPlan
+	addOnSsoLink
+	provisionsBetaExtensions
+}
+
 fragment AppData on App {
 	id
 	name
+	deployed
 	platformVersion
+	secrets {
+		name
+	}
 	organization {
-		id
-		slug
-		rawSlug
-		paidPlan
+		...OrganizationData
 	}
 }
 
@@ -143,6 +189,12 @@ mutation CreateLimitedAccessToken($name: String!, $organizationId: ID!, $profile
 	}
 }
 
+mutation LogOut {
+	logOut(input: {}) {
+		ok
+	}
+}
+
 mutation SetNomadVMCount($input: SetVMCountInput!) {
 	setVmCount(input: $input) {
 		taskGroupCounts {
@@ -159,15 +211,30 @@ mutation DeleteAddOn($name: String) {
 	}
 }
 
+fragment ExtensionProviderData on AddOnProvider {
+	id
+	name
+	displayName
+	tosUrl
+	asyncProvisioning
+  autoProvision
+  selectName
+  selectRegion
+  selectReplicaRegions
+  detectPlatform
+  resourceName
+	nameSuffix
+	beta
+	tosAgreement
+	internal
+	provisioningInstructions
+	excludedRegions {
+		code
+	}
+}
 query GetAddOnProvider($name: String!) {
 	addOnProvider(name: $name) {
-		id
-		name
-		tosUrl
-		displayName
-		excludedRegions {
-			code
-		}
+		...ExtensionProviderData
 	}
 }
 
@@ -178,11 +245,13 @@ query ListAddOns($addOnType: AddOnType) {
 			name
 			addOnPlan {
 				displayName
+				description
 			}
 			privateIp
 			primaryRegion
 			readRegions
 			options
+			metadata
 			organization {
 				id
 				slug
@@ -190,3 +259,23 @@ query ListAddOns($addOnType: AddOnType) {
 		}
 	}
 }
+
+ mutation UpdateAddOn($addOnId: ID!, $planId: ID!, $readRegions: [String!]!, $options: JSON!, $metadata: JSON!) {
+		updateAddOn(input: {addOnId: $addOnId, planId: $planId, readRegions: $readRegions, options: $options, metadata: $metadata}) {
+			addOn {
+				id
+			}
+		}
+  }
+
+ query ListAddOnPlans($addOnType: AddOnType!) {
+		addOnPlans(type: $addOnType) {
+			nodes {
+				id
+				description
+				displayName
+			  maxDataSize
+				pricePerMonth
+			}
+		}
+  }

@@ -5,14 +5,14 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+	fly "github.com/superfly/fly-go"
 	"github.com/superfly/flyctl/agent"
-	"github.com/superfly/flyctl/api"
-	"github.com/superfly/flyctl/client"
 	"github.com/superfly/flyctl/flypg"
 	"github.com/superfly/flyctl/internal/appconfig"
 	"github.com/superfly/flyctl/internal/command"
 	"github.com/superfly/flyctl/internal/command/apps"
 	"github.com/superfly/flyctl/internal/flag"
+	"github.com/superfly/flyctl/internal/flyutil"
 	mach "github.com/superfly/flyctl/internal/machine"
 	"github.com/superfly/flyctl/internal/prompt"
 	"github.com/superfly/flyctl/iostreams"
@@ -42,7 +42,7 @@ func newDetach() *cobra.Command {
 
 func runDetach(ctx context.Context) error {
 	var (
-		client = client.FromContext(ctx).API()
+		client = flyutil.ClientFromContext(ctx)
 
 		pgAppName = flag.FirstArg(ctx)
 		appName   = appconfig.NameFromContext(ctx)
@@ -62,18 +62,10 @@ func runDetach(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-
-	switch pgApp.PlatformVersion {
-	case "machines":
-		return runMachineDetach(ctx, app, pgApp)
-	case "nomad":
-		return runNomadDetach(ctx, app, pgApp)
-	default:
-		return fmt.Errorf("unknown platform version")
-	}
+	return runMachineDetach(ctx, app, pgApp)
 }
 
-func runMachineDetach(ctx context.Context, app *api.AppCompact, pgApp *api.AppCompact) error {
+func runMachineDetach(ctx context.Context, app *fly.AppCompact, pgApp *fly.AppCompact) error {
 	var (
 		MinPostgresHaVersion         = "0.0.19"
 		MinPostgresFlexVersion       = "0.0.3"
@@ -85,7 +77,7 @@ func runMachineDetach(ctx context.Context, app *api.AppCompact, pgApp *api.AppCo
 		return fmt.Errorf("machines could not be retrieved %w", err)
 	}
 
-	if err := hasRequiredVersionOnMachines(machines, MinPostgresHaVersion, MinPostgresFlexVersion, MinPostgresStandaloneVersion); err != nil {
+	if err := hasRequiredVersionOnMachines(app.Name, machines, MinPostgresHaVersion, MinPostgresFlexVersion, MinPostgresStandaloneVersion); err != nil {
 		return err
 	}
 
@@ -101,42 +93,10 @@ func runMachineDetach(ctx context.Context, app *api.AppCompact, pgApp *api.AppCo
 	return detachAppFromPostgres(ctx, leader.PrivateIP, app, pgApp)
 }
 
-func runNomadDetach(ctx context.Context, app *api.AppCompact, pgApp *api.AppCompact) error {
-	var (
-		MinPostgresHaVersion = "0.0.19"
-		client               = client.FromContext(ctx).API()
-	)
-
-	agentclient, err := agent.Establish(ctx, client)
-	if err != nil {
-		return fmt.Errorf("can't establish agent %w", err)
-	}
-
-	if err := hasRequiredVersionOnNomad(pgApp, MinPostgresHaVersion, MinPostgresHaVersion); err != nil {
-		return err
-	}
-
-	pgInstances, err := agentclient.Instances(ctx, pgApp.Organization.Slug, pgApp.Name)
-	if err != nil {
-		return fmt.Errorf("failed to lookup 6pn ip for %s app: %v", pgApp.Name, err)
-	}
-
-	if len(pgInstances.Addresses) == 0 {
-		return fmt.Errorf("no 6pn ips found for %s app", pgApp.Name)
-	}
-
-	leaderIP, err := leaderIpFromNomadInstances(ctx, pgInstances.Addresses)
-	if err != nil {
-		return err
-	}
-
-	return detachAppFromPostgres(ctx, leaderIP, app, pgApp)
-}
-
 // TODO - This process needs to be re-written to suppport non-interactive terminals.
-func detachAppFromPostgres(ctx context.Context, leaderIP string, app *api.AppCompact, pgApp *api.AppCompact) error {
+func detachAppFromPostgres(ctx context.Context, leaderIP string, app *fly.AppCompact, pgApp *fly.AppCompact) error {
 	var (
-		client = client.FromContext(ctx).API()
+		client = flyutil.ClientFromContext(ctx)
 		dialer = agent.DialerFromContext(ctx)
 		io     = iostreams.FromContext(ctx)
 	)
@@ -193,7 +153,7 @@ func detachAppFromPostgres(ctx context.Context, leaderIP string, app *api.AppCom
 		)
 	}
 
-	input := api.DetachPostgresClusterInput{
+	input := fly.DetachPostgresClusterInput{
 		AppID:                       app.Name,
 		PostgresClusterId:           pgApp.Name,
 		PostgresClusterAttachmentId: targetAttachment.ID,

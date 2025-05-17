@@ -32,14 +32,15 @@ type ListManagedClustersResponse struct {
 	Data []ManagedCluster `json:"data"`
 }
 
-type GetManagedClusterPasswordResponse struct {
-	Status string `json:"status"`
-	Value  string `json:"value"`
+type GetManagedClusterCredentialsResponse struct {
+	Status        string `json:"status"`
+	Password      string `json:"password"`
+	ConnectionUri string `json:"pgbouncer_uri"`
 }
 
 type GetManagedClusterResponse struct {
-	Data     ManagedCluster                    `json:"data"`
-	Password GetManagedClusterPasswordResponse `json:"password"`
+	Data        ManagedCluster                       `json:"data"`
+	Credentials GetManagedClusterCredentialsResponse `json:"credentials"`
 }
 
 func (c *Client) ListManagedClusters(ctx context.Context, orgSlug string) (ListManagedClustersResponse, error) {
@@ -217,7 +218,9 @@ type CreateClusterInput struct {
 }
 
 type CreateClusterResponse struct {
-	Data struct {
+	Ok     bool           `json:"ok"`
+	Errors DetailedErrors `json:"errors"`
+	Data   struct {
 		Id            string                      `json:"id"`
 		Name          string                      `json:"name"`
 		Status        *string                     `json:"status"`
@@ -269,6 +272,14 @@ func (c *Client) CreateCluster(ctx context.Context, input CreateClusterInput) (C
 		return response, nil
 	case http.StatusNotFound:
 		return response, fmt.Errorf("organization %s not found", input.OrgSlug)
+	case http.StatusForbidden:
+		if err = json.Unmarshal(body, &response); err == nil {
+			if response.Errors.Detail != "" {
+				return response, fmt.Errorf(response.Errors.Detail)
+			}
+		}
+
+		return response, fmt.Errorf("failed to create cluster (status %d): %s", res.StatusCode, string(body))
 	case http.StatusInternalServerError:
 		return response, fmt.Errorf("server error: %s", string(body))
 	default:

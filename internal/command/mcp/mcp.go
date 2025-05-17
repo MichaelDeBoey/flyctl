@@ -17,8 +17,15 @@ func New() *cobra.Command {
 
 	cmd.AddCommand(
 		NewProxy(),
+		NewInspect(),
 		newServer(),
 		NewWrap(),
+
+		NewAdd(),
+		NewRemove(),
+
+		NewLaunch(),
+		NewDestroy(),
 	)
 
 	return cmd

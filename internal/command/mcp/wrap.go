@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -29,8 +30,10 @@ import (
 type Server struct {
 	port     int
 	mcp      string
+	token    string
 	user     string
 	password string
+	private  bool
 	cmd      *exec.Cmd
 	args     []string
 	stdin    io.WriteCloser
@@ -52,22 +55,30 @@ func NewWrap() *cobra.Command {
 	flag.Add(cmd,
 		flag.Int{
 			Name:        "port",
-			Description: "[optional] Port to listen on.  Defaults to 8080.",
+			Description: "Port to listen on.",
 			Default:     8080,
 			Shorthand:   "p",
 		},
 		flag.String{
 			Name:        "mcp",
-			Description: "[required] Path to the stdio MCP program to be wrapped.",
+			Description: "Path to the stdio MCP program to be wrapped.",
 			Shorthand:   "m",
 		},
 		flag.String{
+			Name:        "bearer-token",
+			Description: "Bearer token to authenticate with. Defaults to the value of the FLY_MCP_BEARER_TOKEN environment variable.",
+		},
+		flag.String{
 			Name:        "user",
-			Description: "[optional] User to authenticate with. Defaults to the value of the FLY_MCP_USER environment variable.",
+			Description: "User to authenticate with. Defaults to the value of the FLY_MCP_USER environment variable.",
 		},
 		flag.String{
 			Name:        "password",
-			Description: "[optional] Password to authenticate with. Defaults to the value of the FLY_MCP_PASSWORD environment variable.",
+			Description: "Password to authenticate with. Defaults to the value of the FLY_MCP_PASSWORD environment variable.",
+		},
+		flag.Bool{
+			Name:        "private",
+			Description: "Use private networking.",
 		},
 	)
 
@@ -75,11 +86,30 @@ func NewWrap() *cobra.Command {
 }
 
 func runWrap(ctx context.Context) error {
+	token, _ := os.LookupEnv("FLY_MCP_BEARER_TOKEN")
+	user, _ := os.LookupEnv("FLY_MCP_USER")
+	password, _ := os.LookupEnv("FLY_MCP_PASSWORD")
+	_, private := os.LookupEnv("FLY_MCP_PRIVATE")
+
+	if token == "" {
+		token = flag.GetString(ctx, "bearer-token")
+	}
+
+	if user == "" {
+		user = flag.GetString(ctx, "user")
+	}
+
+	if password == "" {
+		password = flag.GetString(ctx, "password")
+	}
+
 	// Create server
 	server := &Server{
 		port:     flag.GetInt(ctx, "port"),
-		user:     flag.GetString(ctx, "user"),
-		password: flag.GetString(ctx, "password"),
+		token:    token,
+		user:     user,
+		password: password,
+		private:  flag.GetBool(ctx, "private") || private,
 		mcp:      flag.GetString(ctx, "mcp"),
 		args:     flag.ExtraArgsFromContext(ctx),
 		client:   nil,
@@ -92,11 +122,6 @@ func runWrap(ctx context.Context) error {
 
 	if server.password == "" {
 		server.password = os.Getenv("FLY_MCP_PASSWORD")
-	}
-
-	// Validate inputs
-	if server.mcp == "" {
-		log.Fatal("--mcp is required")
 	}
 
 	// Start the program
@@ -122,7 +147,19 @@ func runWrap(ctx context.Context) error {
 
 // StartProgram starts the remote program and connects to its stdin/stdout
 func (s *Server) StartProgram() error {
-	cmd := exec.Command(s.mcp, s.args...)
+	command := s.mcp
+	args := s.args
+
+	if command == "" {
+		if len(args) == 0 {
+			return fmt.Errorf("no command specified")
+		}
+
+		command = args[0]
+		args = args[1:]
+	}
+
+	cmd := exec.Command(command, args...)
 
 	// Get stdin pipe
 	stdin, err := cmd.StdinPipe()
@@ -213,7 +250,22 @@ func (s *Server) ReadFromProgram() {
 
 // HandleHTTPRequest handles incoming HTTP requests
 func (s *Server) HandleHTTPRequest(w http.ResponseWriter, r *http.Request) {
-	if s.user != "" {
+	if s.private {
+		clientIP := r.Header.Get("Fly-Client-Ip")
+		if clientIP != "" && !strings.HasPrefix(clientIP, "fdaa:") {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+	}
+
+	if s.token != "" {
+		// Check for bearer token
+		bearerToken := r.Header.Get("Authorization")
+		if bearerToken == "" || !strings.HasPrefix(bearerToken, "Bearer ") || strings.TrimSpace(bearerToken[7:]) != s.token {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+	} else if s.user != "" {
 		// Check for basic authentication
 		user, password, ok := r.BasicAuth()
 		if !ok || user != s.user || password != s.password {
@@ -224,6 +276,16 @@ func (s *Server) HandleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 
 	// Handle GET requests
 	if r.Method == http.MethodGet {
+
+		// Respond to HTML requests with a simple message
+		acceptHeader := r.Header.Get("Accept")
+		if strings.Contains(acceptHeader, "html") && !strings.Contains(acceptHeader, "json") {
+			w.Header().Set("Content-Type", "text/plain")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("MCP Server"))
+			return
+		}
+
 		// Set headers for SSE
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
